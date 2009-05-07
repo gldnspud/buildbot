@@ -260,8 +260,8 @@ def parse_options():
             help=master_help)
     repo_help = ("Repository URL to report. Default is %(repo)s" %
                  {'repo': repo})
-    parser.add_otion('-r', '--repo', action='store', type='string',
-                     help=repo_help)
+    parser.add_option('-r', '--repo', action='store', type='string',
+                      help=repo_help)
     options, args = parser.parse_args()
     return options
 
