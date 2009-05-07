@@ -37,9 +37,11 @@ from buildbot.scripts import runner
 from optparse import OptionParser
 
 # Modify this to fit your setup, or pass in --master server:host on the
-# command line
+# command line and/or --repo repourl
 
 master = "localhost:9989"
+repo = "git://example.com/path/to/repo.git"
+
 
 # The GIT_DIR environment variable must have been set up so that any
 # git commands that are executed will operate on the repository we're
@@ -256,6 +258,10 @@ def parse_options():
                    { 'master' : master })
     parser.add_option("-m", "--master", action="store", type="string",
             help=master_help)
+    repo_help = ("Repository URL to report. Default is %(repo)s" %
+                 {'repo': repo})
+    parser.add_otion('-r', '--repo', action='store', type='string',
+                     help=repo_help)
     options, args = parser.parse_args()
     return options
 
@@ -286,6 +292,8 @@ try:
 
     if options.master:
         master=options.master
+    if options.repo:
+        repo = options.repo
 
     process_changes()
 except SystemExit:
