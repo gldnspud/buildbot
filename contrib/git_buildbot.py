@@ -40,7 +40,8 @@ from optparse import OptionParser
 # command line and/or --repo repourl
 
 master = "localhost:9989"
-repo = "git://example.com/path/to/repo.git"
+#repo = "git://example.com/path/to/repo.git"
+repo = None
 
 
 # The GIT_DIR environment variable must have been set up so that any
@@ -63,6 +64,8 @@ def addChange(dummy, remote, changei):
     except StopIteration:
         remote.broker.transport.loseConnection()
         return None
+
+    c['repository'] = repo
 
     logging.info("New revision: %s" % c['revision'][:8])
     for key, value in c.iteritems():
