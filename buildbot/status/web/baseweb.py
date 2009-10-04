@@ -16,9 +16,11 @@ from buildbot.status.web.base import HtmlResource, Box, \
 from buildbot.status.web.feeds import Rss20StatusResource, \
      Atom10StatusResource
 from buildbot.status.web.waterfall import WaterfallStatusResource
+from buildbot.status.web.console import ConsoleStatusResource
 from buildbot.status.web.grid import GridStatusResource, TransposedGridStatusResource
 from buildbot.status.web.changes import ChangesResource
 from buildbot.status.web.builder import BuildersResource
+from buildbot.status.web.buildstatus import BuildStatusStatusResource 
 from buildbot.status.web.slaves import BuildSlavesResource
 from buildbot.status.web.xmlrpc import XMLRPCServer
 from buildbot.status.web.about import AboutBuildbot
@@ -71,7 +73,7 @@ def getLastNBuilds(status, numbuilds, builders=[], branches=[]):
 
 
 # /one_line_per_build
-#  accepts builder=, branch=, numbuilds=
+#  accepts builder=, branch=, numbuilds=, reload=
 class OneLinePerBuild(HtmlResource, OneLineMixin):
     """This shows one line per build, combining all builders together. Useful
     query arguments:
@@ -79,6 +81,7 @@ class OneLinePerBuild(HtmlResource, OneLineMixin):
     numbuilds=: how many lines to display
     builder=: show only builds for this builder. Multiple builder= arguments
               can be used to see builds from any builder in the set.
+    reload=: reload the page after this many seconds
     """
 
     title = "Recent Builds"
@@ -91,6 +94,22 @@ class OneLinePerBuild(HtmlResource, OneLineMixin):
         status = self.getStatus(req)
         builder = status.getBuilder(path)
         return OneLinePerBuildOneBuilder(builder, numbuilds=self.numbuilds)
+
+    def get_reload_time(self, request):
+        if "reload" in request.args:
+            try:
+                reload_time = int(request.args["reload"][0])
+                return max(reload_time, 15)
+            except ValueError:
+                pass
+        return None
+
+    def head(self, request):
+        head = ''
+        reload_time = self.get_reload_time(request)
+        if reload_time is not None:
+            head += '<meta http-equiv="refresh" content="%d">\n' % reload_time
+        return head
 
     def body(self, req):
         status = self.getStatus(req)
@@ -105,10 +124,12 @@ class OneLinePerBuild(HtmlResource, OneLineMixin):
         data = ""
 
         # really this is "up to %d builds"
+        html_branches = map(html.escape, branches)
         data += "<h1>Last %d finished builds: %s</h1>\n" % \
-                (numbuilds, ", ".join(branches))
+                (numbuilds, ", ".join(html_branches))
         if builders:
-            data += ("<p>of builders: %s</p>\n" % (", ".join(builders)))
+            html_builders = map(html.escape, builders)
+            data += ("<p>of builders: %s</p>\n" % (", ".join(html_builders)))
         data += "<ul>\n"
         got = 0
         building = False
@@ -161,8 +182,9 @@ class OneLinePerBuildOneBuilder(HtmlResource, OneLineMixin):
                                                 numbuilds)
 
         data = ""
+        html_branches = map(html.escape, branches)
         data += ("<h1>Last %d builds of builder %s: %s</h1>\n" %
-                 (numbuilds, self.builder_name, ", ".join(branches)))
+                 (numbuilds, self.builder_name, ", ".join(html_branches)))
         data += "<ul>\n"
         got = 0
         for build in g:
@@ -197,7 +219,8 @@ class OneBoxPerBuilder(HtmlResource):
 
         data = ""
 
-        data += "<h2>Latest builds: %s</h2>\n" % ", ".join(branches)
+        html_branches = map(html.escape, branches)
+        data += "<h2>Latest builds: %s</h2>\n" % ", ".join(html_branches)
         data += "<table>\n"
 
         building = False
@@ -492,10 +515,12 @@ class WebStatus(service.MultiService):
         #self.putChild("", IndexOrWaterfallRedirection())
         self.putChild("waterfall", WaterfallStatusResource())
         self.putChild("grid", GridStatusResource())
+        self.putChild("console", ConsoleStatusResource())
         self.putChild("tgrid", TransposedGridStatusResource())
         self.putChild("builders", BuildersResource()) # has builds/steps/logs
         self.putChild("changes", ChangesResource())
         self.putChild("buildslaves", BuildSlavesResource())
+        self.putChild("buildstatus", BuildStatusStatusResource())
         #self.putChild("schedulers", SchedulersResource())
         self.putChild("one_line_per_build",
                       OneLinePerBuild(numbuilds=numbuilds))

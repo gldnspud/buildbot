@@ -1,6 +1,6 @@
 # -*- test-case-name: buildbot.test.test_slavecommand -*-
 
-import os, sys, re, signal, shutil, types, time
+import os, sys, re, signal, shutil, types, time, tarfile, tempfile
 from stat import ST_CTIME, ST_MTIME, ST_SIZE
 
 from zope.interface import implements
@@ -11,6 +11,7 @@ from twisted.python.procutils import which
 
 from buildbot.slave.interfaces import ISlaveCommand
 from buildbot.slave.registry import registerSlaveCommand
+from buildbot.util import to_text
 
 # this used to be a CVS $-style "Revision" auto-updated keyword, but since I
 # moved to Darcs as the primary repository, this is updated manually each
@@ -66,7 +67,7 @@ class Obfuscated:
                 if isinstance(elt, Obfuscated):
                     rv.append(elt.real)
                 else:
-                    rv.append(elt)
+                    rv.append(to_text(elt))
         return rv
     get_real = staticmethod(get_real)
 
@@ -78,7 +79,7 @@ class Obfuscated:
                 if isinstance(elt, Obfuscated):
                     rv.append(elt.fake)
                 else:
-                    rv.append(elt)
+                    rv.append(to_text(elt))
         return rv
     get_fake = staticmethod(get_fake)
 
@@ -199,16 +200,21 @@ class ShellCommandPP(ProcessProtocol):
 class LogFileWatcher:
     POLL_INTERVAL = 2
 
-    def __init__(self, command, name, logfile):
+    def __init__(self, command, name, logfile, follow=False):
         self.command = command
         self.name = name
         self.logfile = logfile
+
         log.msg("LogFileWatcher created to watch %s" % logfile)
         # we are created before the ShellCommand starts. If the logfile we're
         # supposed to be watching already exists, record its size and
         # ctime/mtime so we can tell when it starts to change.
         self.old_logfile_stats = self.statFile()
         self.started = False
+
+        # follow the file, only sending back lines
+        # added since we started watching
+        self.follow = follow
 
         # every 2 seconds we check on the file again
         self.poller = task.LoopingCall(self.poll)
@@ -245,6 +251,11 @@ class LogFileWatcher:
                 self.old_logfile_stats = None
                 return # no file to work with
             self.f = open(self.logfile, "rb")
+            # if we only want new lines, seek to
+            # where we stat'd so we only find new
+            # lines
+            if self.follow:
+                self.f.seek(s[2], 0)
             self.started = True
         self.f.seek(self.f.tell(), 0)
         while True:
@@ -274,9 +285,9 @@ class ShellCommand:
     def __init__(self, builder, command,
                  workdir, environ=None,
                  sendStdout=True, sendStderr=True, sendRC=True,
-                 timeout=None, initialStdin=None, keepStdinOpen=False,
-                 keepStdout=False, keepStderr=False, logEnviron=True,
-                 logfiles={}, usePTY="slave-config"):
+                 timeout=None, maxTime=None, initialStdin=None,
+                 keepStdinOpen=False, keepStdout=False, keepStderr=False,
+                 logEnviron=True, logfiles={}, usePTY="slave-config"):
         """
 
         @param keepStdout: if True, we keep a copy of all the stdout text
@@ -297,6 +308,8 @@ class ShellCommand:
         self.sendRC = sendRC
         self.logfiles = logfiles
         self.workdir = workdir
+        if not os.path.exists(workdir):
+            os.makedirs(workdir)
         self.environ = os.environ.copy()
         if environ:
             if environ.has_key('PYTHONPATH'):
@@ -323,6 +336,8 @@ class ShellCommand:
         self.logEnviron = logEnviron
         self.timeout = timeout
         self.timer = None
+        self.maxTime = maxTime
+        self.maxTimer = None
         self.keepStdout = keepStdout
         self.keepStderr = keepStderr
 
@@ -342,9 +357,19 @@ class ShellCommand:
             self.usePTY = False
 
         self.logFileWatchers = []
-        for name,filename in self.logfiles.items():
+        for name,filevalue in self.logfiles.items():
+            filename = filevalue
+            follow = False
+
+            # check for a dictionary of options
+            # filename is required, others are optional
+            if type(filevalue) == dict:
+                filename = filevalue['filename']
+                follow = filevalue.get('follow', False)
+
             w = LogFileWatcher(self, name,
-                               os.path.join(self.workdir, filename))
+                               os.path.join(self.workdir, filename),
+                               follow=follow)
             self.logFileWatchers.append(w)
 
     def __repr__(self):
@@ -495,6 +520,9 @@ class ShellCommand:
         if self.timeout:
             self.timer = reactor.callLater(self.timeout, self.doTimeout)
 
+        if self.maxTime:
+            self.maxTimer = reactor.callLater(self.maxTime, self.doMaxTimeout)
+
         for w in self.logFileWatchers:
             w.start()
 
@@ -547,6 +575,9 @@ class ShellCommand:
         if self.timer:
             self.timer.cancel()
             self.timer = None
+        if self.maxTimer:
+            self.maxTimer.cancel()
+            self.maxTimer = None
         d = self.deferred
         self.deferred = None
         if d:
@@ -559,6 +590,9 @@ class ShellCommand:
         if self.timer:
             self.timer.cancel()
             self.timer = None
+        if self.maxTimer:
+            self.maxTimer.cancel()
+            self.maxTimer = None
         d = self.deferred
         self.deferred = None
         if d:
@@ -571,14 +605,22 @@ class ShellCommand:
         msg = "command timed out: %d seconds without output" % self.timeout
         self.kill(msg)
 
+    def doMaxTimeout(self):
+        self.maxTimer = None
+        msg = "command timed out: %d seconds elapsed" % self.maxTime
+        self.kill(msg)
+
     def kill(self, msg):
         # This may be called by the timeout, or when the user has decided to
         # abort this build.
         if self.timer:
             self.timer.cancel()
             self.timer = None
-        if hasattr(self.process, "pid"):
-            msg += ", killing pid %d" % self.process.pid
+        if self.maxTimer:
+            self.maxTimer.cancel()
+            self.maxTimer = None
+        if hasattr(self.process, "pid") and self.process.pid is not None:
+            msg += ", killing pid %s" % self.process.pid
         log.msg(msg)
         self.sendStatus({'header': "\n" + msg + "\n"})
 
@@ -604,6 +646,8 @@ class ShellCommand:
                     log.msg("signal module is missing SIG%s" % self.KILL)
                 elif not hasattr(os, "kill"):
                     log.msg("os module is missing the 'kill' function")
+                elif not hasattr(self.process, "pid") or self.process.pid is None:
+                    log.msg("self.process has no pid")
                 else:
                     log.msg("trying os.kill(-pid, %d)" % (sig,))
                     # TODO: maybe use os.killpg instead of a negative pid?
@@ -916,7 +960,7 @@ class SlaveFileUploadCommand(Command):
 registerSlaveCommand("uploadFile", SlaveFileUploadCommand, command_version)
 
 
-class SlaveDirectoryUploadCommand(Command):
+class SlaveDirectoryUploadCommand(SlaveFileUploadCommand):
     """
     Upload a directory from slave to build master
     Arguments:
@@ -926,6 +970,7 @@ class SlaveDirectoryUploadCommand(Command):
         - ['writer']:    RemoteReference to a transfer._DirectoryWriter object
         - ['maxsize']:   max size (in bytes) of file to write
         - ['blocksize']: max size for each data block
+        - ['compress']:  one of [None, 'bz2', 'gz']
     """
     debug = True
 
@@ -935,6 +980,7 @@ class SlaveDirectoryUploadCommand(Command):
         self.writer = args['writer']
         self.remaining = args['maxsize']
         self.blocksize = args['blocksize']
+        self.compress = args['compress']
         self.stderr = None
         self.rc = 0
 
@@ -942,63 +988,46 @@ class SlaveDirectoryUploadCommand(Command):
         if self.debug:
             log.msg('SlaveDirectoryUploadCommand started')
 
-        # create some lists with all files and directories
-        foundFiles = []
-        foundDirs = []
-
-        self.baseRoot = os.path.join(self.builder.basedir,
-                                     self.workdir,
-                                     os.path.expanduser(self.dirname))
+        self.path = os.path.join(self.builder.basedir,
+                                 self.workdir,
+                                 os.path.expanduser(self.dirname))
         if self.debug:
-            log.msg("baseRoot: %r" % self.baseRoot)
+            log.msg("path: %r" % self.path)
 
-        for root, dirs, files in os.walk(self.baseRoot):
-            tempRoot = root
-            relRoot = ''
-            while (tempRoot != self.baseRoot):
-                tempRoot, tempRelRoot = os.path.split(tempRoot)
-                relRoot = os.path.join(tempRelRoot, relRoot)
-            for name in files:
-                foundFiles.append(os.path.join(relRoot, name))
-            for directory in dirs:
-                foundDirs.append(os.path.join(relRoot, directory))
+        # Create temporary archive
+        fd, self.tarname = tempfile.mkstemp()
+        fileobj = os.fdopen(fd, 'w')
+        if self.compress == 'bz2':
+            mode='w|bz2'
+        elif self.compress == 'gz':
+            mode='w|gz'
+        else:
+            mode = 'w'
+        archive = tarfile.open(name=self.tarname, mode=mode, fileobj=fileobj)
+        archive.add(self.path, '')
+        archive.close()
+        fileobj.close()
 
-        if self.debug:
-            log.msg("foundDirs: %s" % (str(foundDirs)))
-            log.msg("foundFiles: %s" % (str(foundFiles)))
+        # Transfer it
+        self.fp = open(self.tarname, 'rb')
 
-        # create all directories on the master, to catch also empty ones
-        for dirname in foundDirs:
-            dirname = dirname.split(os.path.sep)
-            self.writer.callRemote("createdir", dirname)
+        self.sendStatus({'header': "sending %s" % self.path})
 
-        for filename in foundFiles:
-            self._writeFile(filename)
-
-        return None
-
-    def _writeFile(self, filename):
-        """Write a file to the remote writer"""
-
-        log.msg("_writeFile: %r" % (filename))
-        self.writer.callRemote('open', filename.split(os.path.sep))
-        data = open(os.path.join(self.baseRoot, filename), "r").read()
-        self.writer.callRemote('write', data)
-        self.writer.callRemote('close')
-        return None
-
-    def interrupt(self):
-        if self.debug:
-            log.msg('interrupted')
-        if self.interrupted:
-            return
-        if self.stderr is None:
-            self.stderr = 'Upload of %r interrupted' % self.path
-            self.rc = 1
-        self.interrupted = True
-        # the next _writeBlock call will notice the .interrupted flag
+        d = defer.Deferred()
+        reactor.callLater(0, self._loop, d)
+        def unpack(res):
+            # unpack the archive, but pass through any errors from _loop
+            d1 = self.writer.callRemote("unpack")
+            d1.addErrback(log.err)
+            d1.addCallback(lambda ignored: res)
+            return d1
+        d.addCallback(unpack)
+        d.addBoth(self.finished)
+        return d
 
     def finished(self, res):
+        self.fp.close()
+        os.remove(self.tarname)
         if self.debug:
             log.msg('finished: stderr=%r, rc=%r' % (self.stderr, self.rc))
         if self.stderr is None:
@@ -1182,10 +1211,12 @@ class SlaveShellCommand(Command):
                       configuration of the slave)
         - ['not_really']: 1 to skip execution and return rc=0
         - ['timeout']: seconds of silence to tolerate before killing command
+        - ['maxTime']: seconds before killing command
         - ['logfiles']: dict mapping LogFile name to the workdir-relative
                         filename of a local log file. This local file will be
                         watched just like 'tail -f', and all changes will be
                         written to 'log' status updates.
+        - ['logEnviron']: False to not log the environment variables on the slave
 
     ShellCommand creates the following status messages:
         - {'stdout': data} : when stdout data is available
@@ -1204,6 +1235,7 @@ class SlaveShellCommand(Command):
         c = ShellCommand(self.builder, args['command'],
                          workdir, environ=args.get('env'),
                          timeout=args.get('timeout', None),
+                         maxTime=args.get('maxTime', None),
                          sendStdout=args.get('want_stdout', True),
                          sendStderr=args.get('want_stderr', True),
                          sendRC=True,
@@ -1211,6 +1243,7 @@ class SlaveShellCommand(Command):
                          keepStdinOpen=args.get('keep_stdin_open'),
                          logfiles=args.get('logfiles', {}),
                          usePTY=args.get('usePTY', "slave-config"),
+                         logEnviron=args.get('logEnviron', True),
                          )
         self.command = c
         d = self.command.start()
@@ -1345,6 +1378,8 @@ class SourceBase(Command):
         - ['timeout']:  seconds of silence tolerated before we kill off the
                         command
 
+        - ['maxTime']:  seconds before we kill off the command
+
         - ['retry']:    If not None, this is a tuple of (delay, repeats)
                         which means that any failed VC updates should be
                         reattempted, up to REPEATS times, after a delay of
@@ -1366,6 +1401,7 @@ class SourceBase(Command):
         self.revision = args.get('revision')
         self.patch = args.get('patch')
         self.timeout = args.get('timeout', 120)
+        self.maxTime = args.get('maxTime', None)
         self.retry = args.get('retry')
         # VC-specific subclasses should override this to extract more args.
         # Make sure to upcall!
@@ -1552,7 +1588,8 @@ class SourceBase(Command):
             return defer.succeed(0)
         command = ["rm", "-rf", d]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=0, timeout=self.timeout, usePTY=False)
+                         sendRC=0, timeout=self.timeout, maxTime=self.maxTime,
+                         usePTY=False)
 
         self.command = c
         # sendRC=0 means the rm command will send stdout/stderr to the
@@ -1582,7 +1619,8 @@ class SourceBase(Command):
 
         command = ['cp', '-R', '-P', '-p', fromdir, todir]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout, maxTime=self.maxTime,
+                         usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -1597,7 +1635,7 @@ class SourceBase(Command):
         # now apply the patch
         c = ShellCommand(self.builder, command, dir,
                          sendRC=False, timeout=self.timeout,
-                         initialStdin=diff, usePTY=False)
+                         maxTime=self.maxTime, initialStdin=diff, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -1613,6 +1651,8 @@ class CVS(SourceBase):
     ['branch']: a '-r' tag or branch name to use for the checkout/update
     ['login']: a string for use as a password to 'cvs login'
     ['global_options']: a list of strings to use before the CVS verb
+    ['checkout_options']: a list of strings to use after checkout,
+                          but before revision and branch specifiers
     """
 
     header = "cvs operation"
@@ -1623,6 +1663,7 @@ class CVS(SourceBase):
         self.cvsroot = args['cvsroot']
         self.cvsmodule = args['cvsmodule']
         self.global_options = args.get('global_options', [])
+        self.checkout_options = args.get('checkout_options', [])
         self.branch = args.get('branch')
         self.login = args.get('login')
         self.sourcedata = "%s\n%s\n%s\n" % (self.cvsroot, self.cvsmodule,
@@ -1643,6 +1684,7 @@ class CVS(SourceBase):
                        + ['login'])
             c = ShellCommand(self.builder, command, d,
                              sendRC=False, timeout=self.timeout,
+                             maxTime=self.maxTime,
                              initialStdin=self.login+"\n", usePTY=False)
             self.command = c
             d = c.start()
@@ -1664,7 +1706,8 @@ class CVS(SourceBase):
         if self.revision:
             command += ['-D', self.revision]
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1677,13 +1720,18 @@ class CVS(SourceBase):
         command = ([self.vcexe, '-d', self.cvsroot, '-z3'] +
                    self.global_options +
                    [verb, '-d', self.srcdir])
+
+        if verb == "checkout":
+            command += self.checkout_options
         if self.branch:
             command += ['-r', self.branch]
         if self.revision:
             command += ['-D', self.revision]
         command += [self.cvsmodule]
+        
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1713,11 +1761,13 @@ class SVN(SourceBase):
         self.svnurl = args['svnurl']
         self.sourcedata = "%s\n" % self.svnurl
 
-        self.extra_args = []
+        self.svn_args = []
         if args.has_key('username'):
-            self.extra_args.extend(["--username", args['username']])
+            self.svn_args.extend(["--username", args['username']])
         if args.has_key('password'):
-            self.extra_args.extend(["--password", Obfuscated(args['password'], "XXXX")])
+            self.svn_args.extend(["--password", Obfuscated(args['password'], "XXXX")])
+        if args.get('extra_args', None) is not None:
+            self.svn_args.extend(args['extra_args'])
 
     def sourcedirIsUpdateable(self):
         if os.path.exists(os.path.join(self.builder.basedir,
@@ -1731,12 +1781,12 @@ class SVN(SourceBase):
         # update: possible for mode in ('copy', 'update')
         d = os.path.join(self.builder.basedir, self.srcdir)
         command = [self.vcexe, 'update'] + \
-                    self.extra_args + \
+                    self.svn_args + \
                     ['--revision', str(revision),
                    '--non-interactive', '--no-auth-cache']
         c = ShellCommand(self.builder, command, d,
                          sendRC=False, timeout=self.timeout,
-                         keepStdout=True, usePTY=False)
+                         maxTime=self.maxTime, keepStdout=True, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1745,20 +1795,20 @@ class SVN(SourceBase):
         d = self.builder.basedir
         if self.mode == "export":
             command = [self.vcexe, 'export'] + \
-                        self.extra_args + \
+                        self.svn_args + \
                         ['--revision', str(revision),
                         '--non-interactive', '--no-auth-cache',
                         self.svnurl, self.srcdir]
         else:
             # mode=='clobber', or copy/update on a broken workspace
             command = [self.vcexe, 'checkout'] + \
-                        self.extra_args + \
+                        self.svn_args + \
                         ['--revision', str(revision),
                         '--non-interactive', '--no-auth-cache',
                         self.svnurl, self.srcdir]
         c = ShellCommand(self.builder, command, d,
                          sendRC=False, timeout=self.timeout,
-                         keepStdout=True, usePTY=False)
+                         maxTime=self.maxTime, keepStdout=True, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1837,7 +1887,8 @@ class Darcs(SourceBase):
         d = os.path.join(self.builder.basedir, self.srcdir)
         command = [self.vcexe, 'pull', '--all', '--verbose']
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1858,7 +1909,8 @@ class Darcs(SourceBase):
         command.append(self.repourl)
 
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         if self.revision:
@@ -1930,7 +1982,8 @@ class Monotone(SourceBase):
                    "-r", self.revision,
                    "-b", self.branch]
         c = ShellCommand(self.builder, command, self.full_srcdir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1944,7 +1997,8 @@ class Monotone(SourceBase):
                    "-b", self.branch,
                    self.full_srcdir]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -1965,7 +2019,8 @@ class Monotone(SourceBase):
             command = [self.monotone, "db", "init",
                        "--db=" + self.full_db_path]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -1977,7 +2032,8 @@ class Monotone(SourceBase):
         command = [self.monotone, "--db=" + self.full_db_path,
                    "pull", "--ticker=dot", self.server_addr, self.branch]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self._pull_timeout, usePTY=False)
+                         sendRC=False, timeout=self._pull_timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.sendStatus({"header": "pulling %s from %s\n"
                                    % (self.branch, self.server_addr)})
         self.command = c
@@ -2004,6 +2060,7 @@ class Git(SourceBase):
 
     def setup(self, args):
         SourceBase.setup(self, args)
+        self.vcexe = getCommand("git")
         self.repourl = args['repourl']
         self.branch = args.get('branch')
         if not self.branch:
@@ -2025,6 +2082,17 @@ class Git(SourceBase):
     def readSourcedata(self):
         return open(self.sourcedatafile, "r").read()
 
+    def _dovccmd(self, command, cb=None, **kwargs):
+        c = ShellCommand(self.builder, [self.vcexe] + command, self._fullSrcdir(),
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False, **kwargs)
+        self.command = c
+        d = c.start()
+        if cb:
+            d.addCallback(self._abandonOnFailure)
+            d.addCallback(cb)
+        return d
+
     # If the repourl matches the sourcedata file, then
     # we can say that the sourcedata matches.  We can
     # ignore branch changes, since Git can work with
@@ -2039,12 +2107,17 @@ class Git(SourceBase):
             return False
         return True
 
-    def _didSubmodules(self, res):
-        command = ['git', 'submodule', 'update', '--init']
-        c = ShellCommand(self.builder, command, self._fullSrcdir(),
-                         sendRC=False, timeout=self.timeout, usePTY=False)
-        self.command = c
-        return c.start()
+    def _cleanSubmodules(self, res):
+        return self._dovccmd(['submodule', 'foreach', 'git', 'clean', '-dfx'])
+
+    def _updateSubmodules(self, res):
+        return self._dovccmd(['submodule', 'update'], self._cleanSubmodules)
+
+    def _initSubmodules(self, res):
+        if self.submodules:
+            return self._dovccmd(['submodule', 'init'], self._updateSubmodules)
+        else:
+            return defer.succeed(0)
 
     def _didFetch(self, res):
         if self.revision:
@@ -2052,66 +2125,51 @@ class Git(SourceBase):
         else:
             head = 'FETCH_HEAD'
 
-        command = ['git', 'reset', '--hard', head]
-        c = ShellCommand(self.builder, command, self._fullSrcdir(),
-                         sendRC=False, timeout=self.timeout, usePTY=False)
-        self.command = c
-        d = c.start()
-        if self.submodules:
-            d.addCallback(self._abandonOnFailure)
-            d.addCallback(self._didSubmodules)
-        return d
+        command = ['reset', '--hard', head]
+        return self._dovccmd(command, self._initSubmodules)
 
     # Update first runs "git clean", removing local changes, This,
     # combined with the later "git reset" equates clobbering the repo,
     # but it's much more efficient.
     def doVCUpdate(self):
-        command = ['git', 'clean', '-f', '-d', '-x']
-        c = ShellCommand(self.builder, command, self._fullSrcdir(),
-                         sendRC=False, timeout=self.timeout, usePTY=False)
-        self.command = c
-        d = c.start()
-        d.addCallback(self._abandonOnFailure)
-        d.addCallback(self._didClean)
-        return d
+        command = ['clean', '-f', '-d', '-x']
+        return self._dovccmd(command, self._didClean)
 
-    def _didClean(self, dummy):
-        command = ['git', 'fetch', '-t', self.repourl, self.branch]
+    def _doFetch(self, dummy):
+        command = ['fetch', '-t', self.repourl, self.branch]
         self.sendStatus({"header": "fetching branch %s from %s\n"
                                         % (self.branch, self.repourl)})
-        c = ShellCommand(self.builder, command, self._fullSrcdir(),
-                         sendRC=False, timeout=self.timeout, usePTY=False)
-        self.command = c
-        d = c.start()
-        d.addCallback(self._abandonOnFailure)
-        d.addCallback(self._didFetch)
-        return d
+        return self._dovccmd(command, self._didFetch)
+
+    def _didClean(self, dummy):
+        # After a clean, try to use the given revision if we have one.
+        if self.revision:
+            # We know what revision we want.  See if we have it.
+            d = self._dovccmd(['reset', '--hard', self.revision],
+                              self._initSubmodules)
+            # If we are unable to reset to the specified version, we
+            # must do a fetch first and retry.
+            d.addErrback(self._doFetch)
+            return d
+        else:
+            # No known revision, go grab the latest.
+            return self._doFetch(None)
 
     def _didInit(self, res):
         return self.doVCUpdate()
 
     def doVCFull(self):
         os.mkdir(self._fullSrcdir())
-        c = ShellCommand(self.builder, ['git', 'init'], self._fullSrcdir(),
-                         sendRC=False, timeout=self.timeout, usePTY=False)
-        self.command = c
-        d = c.start()
-        d.addCallback(self._abandonOnFailure)
-        d.addCallback(self._didInit)
-        return d
+        return self._dovccmd(['init'], self._didInit)
 
     def parseGotRevision(self):
-        command = ['git', 'rev-parse', 'HEAD']
-        c = ShellCommand(self.builder, command, self._fullSrcdir(),
-                         sendRC=False, keepStdout=True, usePTY=False)
-        d = c.start()
+        command = ['rev-parse', 'HEAD']
         def _parse(res):
-            hash = c.stdout.strip()
+            hash = self.command.stdout.strip()
             if len(hash) != 40:
                 return None
             return hash
-        d.addCallback(_parse)
-        return d
+        return self._dovccmd(command, _parse, keepStdout=True)
 
 registerSlaveCommand("git", Git, command_version)
 
@@ -2161,7 +2219,8 @@ class Arch(SourceBase):
         if self.revision:
             command.append(self.revision)
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -2173,8 +2232,8 @@ class Arch(SourceBase):
 
         command = [self.vcexe, 'register-archive', '--force', self.url]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, keepStdout=True,
-                         timeout=self.timeout, usePTY=False)
+                         sendRC=False, keepStdout=True, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -2207,7 +2266,8 @@ class Arch(SourceBase):
                    '--no-pristine',
                    ver, self.srcdir]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -2219,7 +2279,8 @@ class Arch(SourceBase):
         d = os.path.join(self.builder.basedir, self.srcdir)
         command = [self.vcexe, 'build-config', self.buildconfig]
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -2279,7 +2340,8 @@ class Bazaar(Arch):
         command = [self.vcexe, 'get', '--no-pristine',
                    ver, self.srcdir]
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -2354,7 +2416,8 @@ class Bzr(SourceBase):
         srcdir = os.path.join(self.builder.basedir, self.srcdir)
         command = [self.vcexe, 'update']
         c = ShellCommand(self.builder, command, srcdir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -2382,7 +2445,8 @@ class Bzr(SourceBase):
         command.append(self.srcdir)
 
         c = ShellCommand(self.builder, command, d,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         return d
@@ -2397,13 +2461,15 @@ class Bzr(SourceBase):
         command.append(self.repourl)
         command.append(tmpdir)
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         d = c.start()
         def _export(res):
             command = [self.vcexe, 'export', srcdir]
             c = ShellCommand(self.builder, command, tmpdir,
-                             sendRC=False, timeout=self.timeout, usePTY=False)
+                             sendRC=False, timeout=self.timeout,
+                             maxTime=self.maxTime, usePTY=False)
             self.command = c
             return c.start()
         d.addCallback(_export)
@@ -2469,7 +2535,7 @@ class Mercurial(SourceBase):
     """Mercurial specific VC operation. In addition to the arguments
     handled by SourceBase, this command reads the following keys:
 
-    ['repourl'] (required): the Cogito repository string
+    ['repourl'] (required): the Mercurial repository string
     """
 
     header = "mercurial operation"
@@ -2478,8 +2544,9 @@ class Mercurial(SourceBase):
         SourceBase.setup(self, args)
         self.vcexe = getCommand("hg")
         self.repourl = args['repourl']
-        self.clobberOnBranchChange = args['clobberOnBranchChange']
+        self.clobberOnBranchChange = args.get('clobberOnBranchChange', True)
         self.sourcedata = "%s\n" % self.repourl
+        self.branchType = args.get('branchType', 'dirname')
         self.stdout = ""
         self.stderr = ""
 
@@ -2492,7 +2559,7 @@ class Mercurial(SourceBase):
         command = [self.vcexe, 'pull', '--verbose', self.repourl]
         c = ShellCommand(self.builder, command, d,
                          sendRC=False, timeout=self.timeout,
-                         keepStdout=True, usePTY=False)
+                         maxTime=self.maxTime, keepStdout=True, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._handleEmptyUpdate)
@@ -2511,9 +2578,17 @@ class Mercurial(SourceBase):
 
     def doVCFull(self):
         d = os.path.join(self.builder.basedir, self.srcdir)
-        command = [self.vcexe, 'clone', '--verbose', '--noupdate', self.repourl, d]
+        command = [self.vcexe, 'clone', '--verbose', '--noupdate']
+
+        # if got revision, clobbering and in dirname, only clone to specific revision 
+        # (otherwise, do full clone to re-use .hg dir for subsequent byuilds) 
+        if self.args.get('revision') and self.mode == 'clobber' and self.branchType == 'dirname': 
+            command.extend(['--rev', self.args.get('revision')]) 
+        command.extend([self.repourl, d])
+        
         c = ShellCommand(self.builder, command, self.builder.basedir,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         cmd1 = c.start()
         cmd1.addCallback(self._update)
@@ -2678,7 +2753,7 @@ class Mercurial(SourceBase):
             updatecmd.extend(['--rev', self.args.get('branch',  'default')])
         self.command = ShellCommand(self.builder, updatecmd,
             self.builder.basedir, sendRC=False,
-            timeout=self.timeout, usePTY=False)
+            timeout=self.timeout, maxTime=self.maxTime, usePTY=False)
         return self.command.start()
 
     def parseGotRevision(self):
@@ -2729,8 +2804,9 @@ class P4Base(SourceBase):
         command.extend(['changes', '-m', '1', '#have'])
         c = ShellCommand(self.builder, command, self.builder.basedir,
                          environ=self.env, timeout=self.timeout,
-                         sendStdout=True, sendStderr=False, sendRC=False,
-                         keepStdout=True, usePTY=False)
+                         maxTime=self.maxTime, sendStdout=True,
+                         sendStderr=False, sendRC=False, keepStdout=True,
+                         usePTY=False)
         self.command = c
         d = c.start()
 
@@ -2816,7 +2892,7 @@ class P4(P4Base):
         env = {}
         c = ShellCommand(self.builder, command, self.builder.basedir,
                          environ=env, sendRC=False, timeout=self.timeout,
-                         keepStdout=True, usePTY=False)
+                         maxTime=self.maxTime, keepStdout=True, usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
@@ -2853,12 +2929,19 @@ class P4(P4Base):
         log.msg(client_spec)
         c = ShellCommand(self.builder, command, self.builder.basedir,
                          environ=env, sendRC=False, timeout=self.timeout,
-                         initialStdin=client_spec, usePTY=False)
+                         maxTime=self.maxTime, initialStdin=client_spec,
+                         usePTY=False)
         self.command = c
         d = c.start()
         d.addCallback(self._abandonOnFailure)
         d.addCallback(lambda _: self._doP4Sync(force=True))
         return d
+
+    def parseGotRevision(self):
+        rv = None
+        if self.revision:
+            rv = str(self.revision)
+        return rv
 
 registerSlaveCommand("p4", P4, command_version)
 
@@ -2901,7 +2984,8 @@ class P4Sync(P4Base):
             command.extend(['@' + self.revision])
         env = {}
         c = ShellCommand(self.builder, command, d, environ=env,
-                         sendRC=False, timeout=self.timeout, usePTY=False)
+                         sendRC=False, timeout=self.timeout,
+                         maxTime=self.maxTime, usePTY=False)
         self.command = c
         return c.start()
 
@@ -2910,5 +2994,11 @@ class P4Sync(P4Base):
 
     def doVCFull(self):
         return self._doVC(force=True)
+
+    def parseGotRevision(self):
+        rv = None
+        if self.revision:
+            rv = str(self.revision)
+        return rv
 
 registerSlaveCommand("p4sync", P4Sync, command_version)

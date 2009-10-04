@@ -181,6 +181,8 @@ class Source(LoggingBuildStep):
         if patch:
             self.addCompleteLog("patch", patch[1])
 
+        if self.alwaysUseLatest:
+            revision = None
         self.startVC(branch, revision, patch)
 
     def commandComplete(self, cmd):
@@ -214,6 +216,7 @@ class CVS(Source):
 
     def __init__(self, cvsroot, cvsmodule,
                  global_options=[], branch=None, checkoutDelay=None,
+                 checkout_options=[],
                  login=None,
                  **kwargs):
 
@@ -266,7 +269,13 @@ class CVS(Source):
                                '-R'] will also assume the repository is
                                read-only (I assume this means it won't
                                use locks to insure atomic access to the
-                               ,v files)."""
+                               ,v files).
+                               
+        @type  checkout_options: list of strings
+        @param checkout_options: these arguments are inserted in the cvs
+                               command line, after 'checkout' but before
+                               branch or revision specifiers.
+                               """
 
         self.checkoutDelay = checkoutDelay
         self.branch = branch
@@ -275,6 +284,7 @@ class CVS(Source):
         self.addFactoryArguments(cvsroot=cvsroot,
                                  cvsmodule=cvsmodule,
                                  global_options=global_options,
+                                 checkout_options=checkout_options,
                                  branch=branch,
                                  checkoutDelay=checkoutDelay,
                                  login=login,
@@ -283,6 +293,7 @@ class CVS(Source):
         self.args.update({'cvsroot': cvsroot,
                           'cvsmodule': cvsmodule,
                           'global_options': global_options,
+                          'checkout_options':checkout_options,
                           'login': login,
                           })
 
@@ -351,7 +362,8 @@ class SVN(Source):
     name = 'svn'
 
     def __init__(self, svnurl=None, baseURL=None, defaultBranch=None,
-                 directory=None, username=None, password=None, **kwargs):
+                 directory=None, username=None, password=None,
+                 extra_args=None, **kwargs):
         """
         @type  svnurl: string
         @param svnurl: the URL which points to the Subversion server,
@@ -387,6 +399,7 @@ class SVN(Source):
         self.branch = defaultBranch
         self.username = username
         self.password = password
+        self.extra_args = extra_args
 
         Source.__init__(self, **kwargs)
         self.addFactoryArguments(svnurl=svnurl,
@@ -395,6 +408,7 @@ class SVN(Source):
                                  directory=directory,
                                  username=username,
                                  password=password,
+                                 extra_args=extra_args,
                                  )
 
         if not svnurl and not baseURL:
@@ -475,6 +489,9 @@ class SVN(Source):
                 raise BuildSlaveTooOldError(m)
             if self.username is not None: self.args['username'] = self.username
             if self.password is not None: self.args['password'] = self.password
+
+        if self.extra_args is not None:
+            self.args['extra_args'] = self.extra_args
 
         revstuff = []
         if branch is not None and branch != self.branch:
@@ -953,10 +970,11 @@ class Mercurial(Source):
             if branch:
                 self.args['branch'] = branch
         else:
-            self.args['repourl'] = self.baseURL + branch
+            self.args['repourl'] = self.baseURL + (branch or '')
         self.args['revision'] = revision
         self.args['patch'] = patch
         self.args['clobberOnBranchChange'] = self.clobberOnBranchChange
+        self.args['branchType'] = self.branchType
 
         revstuff = []
         if branch is not None and branch != self.branch:

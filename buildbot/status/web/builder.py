@@ -7,11 +7,14 @@ import re, urllib, time
 from twisted.python import log
 from buildbot import interfaces
 from buildbot.status.web.base import HtmlResource, make_row, \
-     make_force_build_form, OneLineMixin, path_to_build, path_to_slave, path_to_builder
+     make_force_build_form, OneLineMixin, path_to_build, path_to_slave, \
+     path_to_builder, path_to_change
 from buildbot.process.base import BuildRequest
+from buildbot.process.properties import Properties
 from buildbot.sourcestamp import SourceStamp
 
 from buildbot.status.web.build import BuildsResource, StatusResourceBuild
+from buildbot import util
 
 # /builders/$builder
 class StatusResourceBuilder(HtmlResource, OneLineMixin):
@@ -45,10 +48,38 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
         if self.builder_control is not None:
             stopURL = path_to_build(req, build) + '/stop'
             data += '''
-<form action="%s" class="command stopbuild" style="display:inline">
+<form method="post" action="%s" class="command stopbuild" style="display:inline">
   <input type="submit" value="Stop Build" />
 </form>''' % stopURL
         return data
+
+    def request_line(self, build_request, req):
+        when = time.strftime("%b %d %H:%M:%S", time.localtime(build_request.getSubmitTime()))
+        delay = util.formatInterval(util.now() - build_request.getSubmitTime())
+        changes = build_request.source.changes
+        if changes:
+            change_strings = []
+            for c in changes:
+                change_strings.append("<a href=\"%s\">%s</a>" % (path_to_change(req, c), c.who))
+            if len(change_strings) == 1:
+                reason = "change by %s" % change_strings[0]
+            else:
+                reason = "changes by %s" % ", ".join(change_strings)
+        elif build_request.source.revision:
+            reason = build_request.source.revision
+        else:
+            reason = "no changes specified"
+
+        if self.builder_control is not None:
+            cancelURL = path_to_builder(req, self.builder_status) + '/cancelbuild'
+            cancelButton = '''
+<form action="%s" class="command cancelbuild" style="display:inline" method="post">
+  <input type="hidden" name="id" value="%s" />
+  <input type="submit" value="Cancel Build" />
+</form>''' % (cancelURL, id(build_request))
+        else:
+            cancelButton = ""
+        return "<font size=\"-1\">(%s, waiting %s)</font>%s%s" % (when, delay, cancelButton, reason)
 
     def body(self, req):
         b = self.builder_status
@@ -76,12 +107,31 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
         else:
             data += "<h2>no current builds</h2>\n"
 
+        pending = b.getPendingBuilds()
+        if pending:
+            data += "<h2>Pending Builds:</h2>\n"
+            data += "<ul>\n"
+            for request in pending:
+                data += " <li>" + self.request_line(request, req) + "</li>\n"
+            data += "</ul>\n"
+
+            cancelURL = path_to_builder(req, self.builder_status) + '/cancelbuild'
+            if self.builder_control is not None:
+                data += '''
+<form action="%s" class="command cancelbuild" style="display:inline" method="post">
+  <input type="hidden" name="id" value="all" />
+  <input type="submit" value="Cancel All" />
+</form>''' % cancelURL
+        else:
+            data += "<h2>no pending builds</h2>\n"
+
         # Then a section with the last 5 builds, with the most recent build
         # distinguished from the rest.
 
         data += "<h2>Recent Builds:</h2>\n"
+        data += "(<a href=\"%s\">view in waterfall</a>)\n" % (self.path_to_root(req)+"waterfall?show="+html.escape(b.getName()))
         data += "<ul>\n"
-        numbuilds = req.args.get('numbuilds', ['5'])[0]
+        numbuilds = int(req.args.get('numbuilds', ['5'])[0])
         for i,build in enumerate(b.generateFinishedBuilds(num_builds=int(numbuilds))):
             data += " <li>" + self.make_line(req, build, False) + "</li>\n"
             if i == 0:
@@ -119,7 +169,7 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
         if control is not None:
             pingURL = path_to_builder(req, b) + '/ping'
             data += """
-            <form action="%s" class='command pingbuilder'>
+            <form method="post" action="%s" class='command pingbuilder'>
             <p>To ping the buildslave(s), push the 'Ping' button</p>
 
             <input type="submit" value="Ping Builder" />
@@ -144,9 +194,15 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
         reason = req.args.get("comments", ["<no reason specified>"])[0]
         branch = req.args.get("branch", [""])[0]
         revision = req.args.get("revision", [""])[0]
+        properties = Properties()
+        for i in (1,2,3):
+            pname = req.args.get("prop%dname" % i, [""])[0]
+            pvalue = req.args.get("prop%dvalue" % i, [""])[0]
+            if pname and pvalue:
+                properties.setProperty(pname, pvalue, "Force Build Form")
 
         r = "The web-page 'force build' button was pressed by '%s': %s\n" \
-            % (name, reason)
+            % (html.escape(name), html.escape(reason))
         log.msg("web forcebuild of builder '%s', branch='%s', revision='%s'"
                 " by user '%s'" % (self.builder_status.getName(), branch,
                                    revision, name))
@@ -160,14 +216,21 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
             if not self.authUser(req):
                 return Redirect("../../authfail")
 
-        # keep weird stuff out of the branch and revision strings. TODO:
-        # centralize this somewhere.
+        # keep weird stuff out of the branch revision, and property strings.
+        # TODO: centralize this somewhere.
         if not re.match(r'^[\w\.\-\/]*$', branch):
             log.msg("bad branch '%s'" % branch)
             return Redirect("..")
         if not re.match(r'^[\w\.\-\/]*$', revision):
             log.msg("bad revision '%s'" % revision)
             return Redirect("..")
+        for p in properties.asList():
+            key = p[0]
+            value = p[1]
+            if not re.match(r'^[\w\.\-\/]*$', key) \
+              or not re.match(r'^[\w\.\-\/]*$', value):
+                log.msg("bad property name='%s', value='%s'" % (key, value))
+                return Redirect("..")
         if not branch:
             branch = None
         if not revision:
@@ -181,7 +244,8 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
         # buildbot.changes.changes.Change instance which is tedious at this
         # stage to compute
         s = SourceStamp(branch=branch, revision=revision)
-        req = BuildRequest(r, s, builderName=self.builder_status.getName())
+        req = BuildRequest(r, s, builderName=self.builder_status.getName(),
+                           properties=properties)
         try:
             self.builder_control.requestBuildSoon(req)
         except interfaces.NoSlaveError:
@@ -195,6 +259,25 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
         log.msg("web ping of builder '%s'" % self.builder_status.getName())
         self.builder_control.ping() # TODO: there ought to be an ISlaveControl
         # send the user back to the builder page
+        return Redirect(".")
+
+    def cancel(self, req):
+        try:
+            request_id = req.args.get("id", [None])[0]
+            if request_id == "all":
+                cancel_all = True
+            else:
+                cancel_all = False
+                request_id = int(request_id)
+        except:
+            request_id = None
+        if request_id:
+            for build_req in self.builder_control.getPendingBuilds():
+                if cancel_all or id(build_req.original_request.status) == request_id:
+                    log.msg("Cancelling %s" % build_req)
+                    build_req.cancel()
+                    if not cancel_all:
+                        break
         return Redirect(".")
 
     def getChild(self, path, req):
@@ -222,6 +305,8 @@ class StatusResourceBuilder(HtmlResource, OneLineMixin):
                     return static.Data(file, "text/html")
                 return static.Data(file, "text/plain")
             return file
+        if path == "cancelbuild":
+            return self.cancel(req)
         if path == "builds":
             return BuildsResource(self.builder_status, self.builder_control)
 

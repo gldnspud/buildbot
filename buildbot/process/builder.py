@@ -2,6 +2,7 @@
 import random, weakref
 from zope.interface import implements
 from twisted.python import log, components
+from twisted.python.failure import Failure
 from twisted.spread import pb
 from twisted.internet import reactor, defer
 
@@ -15,7 +16,8 @@ from buildbot.process import base
  PINGING, # build about to start, making sure it is still alive
  BUILDING, # build is running
  LATENT, # latent slave is not substantiated; similar to idle
- ) = range(5)
+ SUBSTANTIATING,
+ ) = range(6)
 
 
 class AbstractSlaveBuilder(pb.Referenceable):
@@ -259,6 +261,7 @@ class LatentSlaveBuilder(AbstractSlaveBuilder):
                                                          self.builder_name))
 
     def substantiate(self, build):
+        self.state = SUBSTANTIATING
         d = self.slave.substantiate(self)
         if not self.slave.substantiated:
             event = self.builder.builder_status.addEvent(
@@ -368,6 +371,9 @@ class Builder(pb.Referenceable):
             self.slavenames.extend(setup['slavenames'])
         self.builddir = setup['builddir']
         self.buildFactory = setup['factory']
+        self.nextSlave = setup.get('nextSlave')
+        if self.nextSlave is not None and not callable(self.nextSlave):
+            raise ValueError("nextSlave must be callable")
         self.locks = setup.get("locks", [])
         self.env = setup.get('env', {})
         assert isinstance(self.env, dict)
@@ -375,6 +381,9 @@ class Builder(pb.Referenceable):
             raise ValueError("periodicBuildTime can no longer be defined as"
                              " part of the Builder: use scheduler.Periodic"
                              " instead")
+        self.nextBuild = setup.get('nextBuild')
+        if self.nextBuild is not None and not callable(self.nextBuild):
+            raise ValueError("nextBuild must be callable")
 
         # build/wannabuild slots: Build objects move along this sequence
         self.buildable = []
@@ -421,6 +430,10 @@ class Builder(pb.Referenceable):
                     for lock in setup.get('locks',[])]
         if oldlocks != newlocks:
             diffs.append('locks changed from %s to %s' % (oldlocks, newlocks))
+        if setup.get('nextSlave') != self.nextSlave:
+            diffs.append('nextSlave changed from %s to %s' % (self.nextSlave, setup['nextSlave']))
+        if setup.get('nextBuild') != self.nextBuild:
+            diffs.append('nextBuild changed from %s to %s' % (self.nextBuild, setup['nextBuild']))
         return diffs
 
     def __repr__(self):
@@ -440,12 +453,12 @@ class Builder(pb.Referenceable):
         self.buildable.append(req)
         req.requestSubmitted(self)
         self.builder_status.addBuildRequest(req.status)
-        self.maybeStartBuild()
+        self.botmaster.maybeStartAllBuilds()
 
     def cancelBuildRequest(self, req):
         if req in self.buildable:
             self.buildable.remove(req)
-            self.builder_status.removeBuildRequest(req.status)
+            self.builder_status.removeBuildRequest(req.status, cancelled=True)
             return True
         return False
 
@@ -554,7 +567,7 @@ class Builder(pb.Referenceable):
             self.builder_status.addPointEvent(
                 ['added', 'latent', slave.slavename])
             self.slaves.append(sb)
-            reactor.callLater(0, self.maybeStartBuild)
+            reactor.callLater(0, self.botmaster.maybeStartAllBuilds)
 
     def attached(self, slave, remote, commands):
         """This is invoked by the BuildSlave when the self.slavename bot
@@ -676,8 +689,20 @@ class Builder(pb.Referenceable):
                     % self)
             self.updateBigStatus()
             return
-        if self.CHOOSE_SLAVES_RANDOMLY:
-            # TODO prefer idle over latent? maybe other sorting preferences?
+        if self.nextSlave:
+            sb = None
+            try:
+                sb = self.nextSlave(self, available_slaves)
+            except:
+                log.msg("Exception choosing next slave")
+                log.err(Failure())
+
+            if not sb:
+                log.msg("%s: want to start build, but we don't have a remote"
+                        % self)
+                self.updateBigStatus()
+                return
+        elif self.CHOOSE_SLAVES_RANDOMLY:
             sb = random.choice(available_slaves)
         else:
             sb = available_slaves[0]
@@ -685,7 +710,21 @@ class Builder(pb.Referenceable):
         # there is something to build, and there is a slave on which to build
         # it. Grab the oldest request, see if we can merge it with anything
         # else.
-        req = self.buildable.pop(0)
+        if not self.nextBuild:
+            req = self.buildable.pop(0)
+        else:
+            try:
+                req = self.nextBuild(self, self.buildable)
+                if not req:
+                    # Nothing to do
+                    self.updateBigStatus()
+                    return
+                self.buildable.remove(req)
+            except:
+                log.msg("Exception choosing next build")
+                log.err(Failure())
+                self.updateBigStatus()
+                return
         self.builder_status.removeBuildRequest(req.status)
         mergers = []
         botmaster = self.botmaster
@@ -843,12 +882,17 @@ class BuilderControl(components.Adapter):
             return
 
         ss = bs.getSourceStamp(absolute=True)
-        req = base.BuildRequest(reason, ss, self.original.name)
+        req = base.BuildRequest(reason, ss, self.original.name,
+                                properties=bs.getProperties())
         self.requestBuild(req)
 
     def getPendingBuilds(self):
         # return IBuildRequestControl objects
-        raise NotImplementedError
+        retval = []
+        for r in self.original.buildable:
+            retval.append(BuildRequestControl(self.original, r))
+
+        return retval
 
     def getBuild(self, number):
         return self.original.getBuild(number)
@@ -871,3 +915,21 @@ class BuilderControl(components.Adapter):
         return True
 
 components.registerAdapter(BuilderControl, Builder, interfaces.IBuilderControl)
+
+class BuildRequestControl:
+    implements(interfaces.IBuildRequestControl)
+
+    def __init__(self, builder, request):
+        self.original_builder = builder
+        self.original_request = request
+
+    def subscribe(self, observer):
+        raise NotImplementedError
+
+    def unsubscribe(self, observer):
+        raise NotImplementedError
+
+    def cancel(self):
+        self.original_builder.cancelBuildRequest(self.original_request)
+
+

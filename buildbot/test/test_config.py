@@ -1009,6 +1009,37 @@ c['schedulers'] = [s1, Dependent('downstream', s1, ['builder1'])]
         master.loadConfig(lockCfg2c)
         self.failIfIdentical(b1, master.botmaster.builders["builder1"])
 
+    def testNoChangeHorizon(self):
+        master = self.buildmaster
+        master.loadChanges()
+        sourcesCfg = emptyCfg + \
+"""
+from buildbot.changes.pb import PBChangeSource
+c['change_source'] = PBChangeSource()
+"""
+        d = master.loadConfig(sourcesCfg)
+        def _check1(res):
+            self.failUnlessEqual(len(list(self.buildmaster.change_svc)), 1)
+            self.failUnlessEqual(self.buildmaster.change_svc.changeHorizon, 0)
+        d.addCallback(_check1)
+        return d
+
+    def testChangeHorizon(self):
+        master = self.buildmaster
+        master.loadChanges()
+        sourcesCfg = emptyCfg + \
+"""
+from buildbot.changes.pb import PBChangeSource
+c['change_source'] = PBChangeSource()
+c['changeHorizon'] = 5
+"""
+        d = master.loadConfig(sourcesCfg)
+        def _check1(res):
+            self.failUnlessEqual(len(list(self.buildmaster.change_svc)), 1)
+            self.failUnlessEqual(self.buildmaster.change_svc.changeHorizon, 5)
+        d.addCallback(_check1)
+        return d
+
 class ConfigElements(unittest.TestCase):
     # verify that ComparableMixin is working
     def testSchedulers(self):
@@ -1200,6 +1231,7 @@ class Factories(unittest.TestCase):
                                'description': None,
                                'workdir': None,
                                'logfiles': {},
+                               'lazylogfiles': False,
                                'usePTY': "slave-config",
                                })
         shell_args.update(kwargs)
@@ -1217,6 +1249,7 @@ class Factories(unittest.TestCase):
                       'baseURL': None,
                       'defaultBranch': None,
                       'logfiles': {},
+                      'lazylogfiles' : False,
                       }
         darcs_args.update(kwargs)
         self.failUnlessIdentical(factory[0], Darcs)

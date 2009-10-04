@@ -44,6 +44,12 @@ master = "localhost:9989"
 repo = None
 
 
+# When sending the notification, send this category iff
+# it's set (via --category)
+
+category = None
+
+
 # The GIT_DIR environment variable must have been set up so that any
 # git commands that are executed will operate on the repository we're
 # installed in.
@@ -124,6 +130,8 @@ def gen_changes(input, branch):
              'comments': m.group(2),
              'branch': branch,
         }
+        if category:
+            c['category'] = category
         grab_commit_info(c, m.group(1))
         changes.append(c)
 
@@ -185,6 +193,9 @@ def gen_update_branch_changes(oldrev, newrev, refname, branch):
         status = f.close()
         if status:
             logging.warning("git diff exited with status %d" % status)
+
+        if category:
+            c['category'] = category
 
         if files:
             c['files'] = files
@@ -257,7 +268,7 @@ def parse_options():
             help="Log to the specified file")
     parser.add_option("-v", "--verbose", action="count",
             help="Be more verbose. Ignored if -l is not specified.")
-    master_help = ("Build master to push to. Default is %(master)s" % 
+    master_help = ("Build master to push to. Default is %(master)s" %
                    { 'master' : master })
     parser.add_option("-m", "--master", action="store", type="string",
             help=master_help)
@@ -265,6 +276,8 @@ def parse_options():
                  {'repo': repo})
     parser.add_option('-r', '--repo', action='store', type='string',
                       help=repo_help)
+    parser.add_option("-c", "--category", action="store",
+                      type="string", help="Scheduler category to notify.")
     options, args = parser.parse_args()
     return options
 
@@ -297,6 +310,9 @@ try:
         master=options.master
     if options.repo:
         repo = options.repo
+
+    if options.category:
+        category = options.category
 
     process_changes()
 except SystemExit:

@@ -342,6 +342,9 @@ class IBuilderStatus(Interface):
     def getName():
         """Return the name of this Builder (a string)."""
 
+    def getCategory():
+        """Return the category of this builder (a string)."""
+
     def getState():
         # TODO: this isn't nearly as meaningful as it used to be
         """Return a tuple (state, builds) for this Builder. 'state' is the
@@ -440,7 +443,7 @@ class IBuilderStatus(Interface):
         delivered."""
 
 class IEventSource(Interface):
-    def eventGenerator(branches=[]):
+    def eventGenerator(branches=[], categories=[]):
         """This function creates a generator which will yield all of this
         object's status events, starting with the most recent and progressing
         backwards in time. These events provide the IStatusEvent interface.
@@ -451,6 +454,11 @@ class IEventSource(Interface):
         return events that are associated with these branches. If the list is
         empty, events for all branches should be returned (i.e. an empty list
         means 'accept all' rather than 'accept none').
+
+        @param categories: a list of category names.  The generator
+        should only return events that are categorized within the
+        given category.  If the list is empty, events for all
+        categories should be returned.
         """
 
 class IBuildStatus(Interface):
@@ -556,8 +564,8 @@ class IBuildStatus(Interface):
 
     def getResults():
         """Return a constant describing the results of the build: one of the
-        constants in buildbot.status.builder: SUCCESS, WARNINGS, or
-        FAILURE."""
+        constants in buildbot.status.builder: SUCCESS, WARNINGS,
+        FAILURE, SKIPPED or EXCEPTION."""
 
     def getLogs():
         """Return a list of logs that describe the build as a whole. Some
@@ -879,6 +887,13 @@ class IStatusReceiver(Interface):
     def requestSubmitted(request):
         """A new BuildRequest has been submitted to the buildmaster.
 
+        @type request: implementor of L{IBuildRequestStatus}
+        """
+
+    def requestCancelled(builder, request):
+        """A BuildRequest has been cancelled on the given Builder.
+
+        @type builder: L{buildbot.status.builder.BuilderStatus}
         @type request: implementor of L{IBuildRequestStatus}
         """
 

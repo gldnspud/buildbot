@@ -6,7 +6,9 @@ from twisted.internet import defer, reactor
 import urllib, time
 from twisted.python import log
 from buildbot.status.web.base import HtmlResource, make_row, make_stop_form, \
-     css_classes, path_to_builder, path_to_slave, make_name_user_passwd_form
+     make_extra_property_row, css_classes, path_to_builder, path_to_slave, \
+     make_name_user_passwd_form
+
 
 from buildbot.status.web.tests import TestsResource
 from buildbot.status.web.step import StepsResource
@@ -52,7 +54,7 @@ class StatusResourceBuild(HtmlResource):
                 data += make_stop_form(stopURL, self.isUsingUserPasswd(req))
 
         if b.isFinished():
-	    # Results map loosely to css_classes
+            # Results map loosely to css_classes
             results = b.getResults()
             data += "<h2>Results:</h2>\n"
             text = " ".join(b.getText())
@@ -107,19 +109,24 @@ class StatusResourceBuild(HtmlResource):
         data += "<ol>\n"
         for s in b.getSteps():
             name = s.getName()
-	    if s.isFinished():
-		css_class = css_classes[s.getResults()[0]]
-	    elif s.isStarted():
-		css_class = "running"
-	    else:
-		css_class = ""
-            data += (' <li><span class="%s"><a href=\"%s\">%s</a> [%s]</span>\n'
+            time_to_run = 0
+            (start, end) = s.getTimes()
+            if start and end:
+              time_to_run = end - start
+            if s.isFinished():
+                css_class = css_classes[s.getResults()[0]]
+            elif s.isStarted():
+                css_class = "running"
+            else:
+                css_class = ""
+            data += (' <li><span class="%s"><a href=\"%s\">%s</a> [%s] [%d seconds]</span>\n'
                      % (css_class, 
-			req.childLink("steps/%s" % urllib.quote(name)),
+                        req.childLink("steps/%s" % urllib.quote(name)),
                         name,
-                        " ".join(s.getText())))
+                        " ".join(s.getText()),
+                        time_to_run))
+            data += "  <ol>\n"
             if s.getLogs():
-                data += "  <ol>\n"
                 for logfile in s.getLogs():
                     logname = logfile.getName()
                     logurl = req.childLink("steps/%s/logs/%s" %
@@ -127,8 +134,15 @@ class StatusResourceBuild(HtmlResource):
                                             urllib.quote(logname)))
                     data += ("   <li><a href=\"%s\">%s</a></li>\n" %
                              (logurl, logfile.getName()))
-                data += "  </ol>\n"
+            if s.getURLs():
+                for url in s.getURLs().items():
+                    logname = url[0]
+                    logurl = url[1]
+                    data += ('   <li><a href="%s">%s</a></li>\n' %
+                             (logurl, html.escape(logname)))
+            data += "</ol>\n"
             data += " </li>\n"
+
         data += "</ol>\n"
 
         data += "<h2>Build Properties:</h2>\n"
@@ -161,6 +175,9 @@ class StatusResourceBuild(HtmlResource):
         if end:
             data += "<tr><td>End</td><td>%s</td></tr>\n" % time.ctime(end)
             data += "<tr><td>Elapsed</td><td>%s</td></tr>\n" % util.formatInterval(end - start)
+        else:
+            now = util.now()
+            data += "<tr><td>Elapsed</td><td>%s</td></tr>\n" % util.formatInterval(now - start)
         data += "</table>\n"
 
         if ss.changes:
@@ -188,9 +205,12 @@ class StatusResourceBuild(HtmlResource):
                          "after this build was started <b>will</b> be \n"
                          "included in a rebuild.</p>\n")
             rebuildURL = urllib.quote(req.childLink("rebuild"))
-            data += ('<form action="%s" class="command rebuild">\n'
+            data += ('<form method="post" action="%s" class="command rebuild">\n'
                      % rebuildURL)
             data += make_name_user_passwd_form(self.isUsingUserPasswd(req))
+            data += make_extra_property_row(1)
+            data += make_extra_property_row(2)
+            data += make_extra_property_row(3)
             data += make_row("Reason for re-running build:",
                              "<input type='text' name='comments' />")
             data += '<input type="submit" value="Rebuild" />\n'
@@ -231,9 +251,11 @@ class StatusResourceBuild(HtmlResource):
                 (b.getBuilder().getName(), b.getNumber()))
         name = req.args.get("username", ["<unknown>"])[0]
         comments = req.args.get("comments", ["<no reason specified>"])[0]
+        # html-quote both the username and comments, just to be safe
         reason = ("The web-page 'stop build' button was pressed by "
-                  "'%s': %s\n" % (name, comments))
-        c.stopBuild(reason)
+                  "'%s': %s\n" % (html.escape(name), html.escape(comments)))
+        if c:
+            c.stopBuild(reason)
         # we're at http://localhost:8080/svn-hello/builds/5/stop?[args] and
         # we want to go to: http://localhost:8080/svn-hello
         r = Redirect("../..")
@@ -252,7 +274,7 @@ class StatusResourceBuild(HtmlResource):
         name = req.args.get("username", ["<unknown>"])[0]
         comments = req.args.get("comments", ["<no reason specified>"])[0]
         reason = ("The web-page 'rebuild' button was pressed by "
-                  "'%s': %s\n" % (name, comments))
+                  "'%s': %s\n" % (html.escape(name), html.escape(comments)))
         if not bc or not b.isFinished():
             log.msg("could not rebuild: bc=%s, isFinished=%s"
                     % (bc, b.isFinished()))

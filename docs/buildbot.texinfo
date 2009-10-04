@@ -1,7 +1,7 @@
 \input texinfo @c -*-texinfo-*-
 @c %**start of header
 @setfilename buildbot.info
-@settitle BuildBot Manual 0.7.10
+@settitle BuildBot Manual 0.7.11
 @defcodeindex cs
 @defcodeindex sl
 @defcodeindex bf
@@ -223,6 +223,7 @@ Simple ShellCommand Subclasses
 * Test::
 * TreeSize::
 * PerlModuleTest::
+* Testing with mysql-test-run::
 * SetProperty::
 
 Python BuildSteps
@@ -811,7 +812,7 @@ buildbot upgrade-master @var{basedir}
 @end example
 
 This command will also scan your @file{master.cfg} file for
-incompatbilities (by loading it and printing any errors or deprecation
+incompatibilities (by loading it and printing any errors or deprecation
 warnings that occur). Each buildbot release tries to be compatible
 with configurations that worked cleanly (i.e. without deprecation
 warnings) on the previous release: any functions or classes that are
@@ -1246,16 +1247,17 @@ speed up the process.
 @node Forcing Builds,  , Connecting to the buildmaster, Troubleshooting
 @subsection Forcing Builds
 
-From the buildmaster's main status web page, you can force a build to
-be run on your build slave. Figure out which column is for a builder
-that runs on your slave, click on that builder's name, and the page
-that comes up will have a ``Force Build'' button. Fill in the form,
-hit the button, and a moment later you should see your slave's
-@file{twistd.log} filling with commands being run. Using @code{pstree}
-or @code{top} should also reveal the cvs/make/gcc/etc processes being
-run by the buildslave. Note that the same web page should also show
-the @file{admin} and @file{host} information files that you configured
-earlier.
+From the buildmaster's main status web page, you can force a build to be run on
+your build slave if you set the option @code{allowForce=True} in your
+@code{master.cfg} file @pxref{Enabling the "Force Build" Button}.
+
+Figure out which column is for a builder that runs on your slave, click on that
+builder's name, and the page that comes up will have a "Force Build" button.
+Fill in the form, hit the button, and a moment later you should see your
+slave's @file{twistd.log} filling with commands being run. Using @code{pstree}
+or @code{top} should also reveal the cvs/make/gcc/etc processes being run by
+the buildslave. Note that the same web page should also show the @file{admin}
+and @file{host} information files that you configured earlier.
 
 @node Concepts, Configuration, Installation, Top
 @chapter Concepts
@@ -1581,7 +1583,7 @@ to get a tree with a specific state: a tree which includes this Change
 information is unavailable, the @code{.revision} attribute will be
 @code{None}. These revisions are provided by the ChangeSource, and
 consumed by the @code{computeSourceRevision} method in the appropriate
-@code{step.Source} class.
+@code{source.Source} class.
 
 @table @samp
 @item CVS
@@ -1631,6 +1633,12 @@ branch='buildbot--usebranches--0', files=['buildbot/master.py']
 @item Git
 branch='warner-newfeature', files=['src/foo.c']
 @end table
+
+@heading Build Properties
+
+A Change may have one or more properties attached to it, usually specified
+through the Force Build form or @pxref{sendchange}. Properties are discussed
+in detail in the @pxref{Build Properties} section.
 
 @heading Links
 
@@ -1997,6 +2005,9 @@ These properties apply to all builds.
 @item schedulers --
 A scheduler can specify properties available to all the builds it
 starts.
+@item changes --
+A change can have properties attached to it. These are usually specified
+through Force Build or sendchange.
 @item buildslaves --
 A buildslave can pass properties on to the builds it performs.
 @item builds --
@@ -2054,12 +2065,14 @@ understand how to fill in each section properly.
 * Defining the Project::
 * Change Sources and Schedulers::
 * Merging BuildRequests::
+* Prioritizing Builders::
 * Setting the slaveport::
 * Buildslave Specifiers::
 * On-Demand ("Latent") Buildslaves::
 * Defining Global Properties::
 * Defining Builders::
 * Defining Status Targets::
+* Limiting Memory and Disk Usage::
 * Debug options::
 @end menu
 
@@ -2252,6 +2265,20 @@ be a reasonable default on most file systems. This setting has no impact
 on status plugins, and merely affects the required disk space on the
 master for build logs.
 
+@bcindex c['logMaxSize']
+The @code{logMaxSize} parameter sets an upper limit (in bytes) to how large
+logs from an individual build step can be.  The default value is None, meaning
+no upper limit to the log size.  Any output exceeding @code{logMaxSize} will be
+truncated, and a message to this effect will be added to the log's HEADER
+channel.
+
+@bcindex c['logMaxTailSize']
+If @code{logMaxSize} is set, and the output from a step exceeds the maximum,
+the @code{logMaxTailSize} parameter controls how much of the end of the build
+log will be kept.  The effect of setting this parameter is that the log will
+contain the first @code{logMaxSize} bytes and the last @code{logMaxTailSize}
+bytes of output.  Don't set this value too high, as the the tail of the log is
+kept in memory.
 
 @node Change Sources and Schedulers, Merging BuildRequests, Defining the Project, Configuration
 @section Change Sources and Schedulers
@@ -2272,13 +2299,20 @@ Code Changes}.
 from buildbot.changes.pb import PBChangeSource
 c['change_source'] = PBChangeSource()
 @end example
-@bcindex c['schedulers']
 
 (note: in buildbot-0.7.5 and earlier, this key was named
 @code{c['sources']}, and required a list. @code{c['sources']} is
 deprecated as of buildbot-0.7.6 and is scheduled to be removed in a
 future release).
 
+@bcindex c['changeHorizon']
+
+The @code{c['changeHorizon']} key determines how many changes the master will
+keep a record of. One place these changes are displayed is on the waterfall
+page.  This parameter defaults to 0, which means keep all changes indefinitely.
+
+
+@bcindex c['schedulers']
 @code{c['schedulers']} is a list of Scheduler instances, each
 of which causes builds to be started on a particular set of
 Builders. The two basic Scheduler classes you are likely to start
@@ -2472,7 +2506,7 @@ build, then those changes will be included in the downstream build.
 See the @pxref{Triggerable Scheduler} for a more flexible dependency
 mechanism that can avoid this problem.
 
-The arguments to this scheduler are:
+The keyword arguments to this scheduler are:
 
 @table @code
 @item name
@@ -2492,9 +2526,9 @@ Example:
 from buildbot import scheduler
 tests = scheduler.Scheduler("just-tests", None, 5*60,
                             ["full-linux", "full-netbsd", "full-OSX"])
-package = scheduler.Dependent("build-package",
-                              tests, # upstream scheduler -- no quotes!
-                              ["make-tarball", "make-deb", "make-rpm"])
+package = scheduler.Dependent(name="build-package",
+                              upstream=tests, # <- no quotes!
+                              builderNames=["make-tarball", "make-deb", "make-rpm"])
 c['schedulers'] = [tests, package]
 @end example
 
@@ -2690,7 +2724,7 @@ test = scheduler.Triggerable(name="distributed-test",
 package = scheduler.Triggerable(name="package-all-platforms",
                 builderNames=["package-all-platforms"])
 
-c['schedulers'] = [checkin, nightly, build, test, package]
+c['schedulers'] = [mktarball, checkin, nightly, build, test, package]
 
 # on checkin, make a tarball, build it, and test it
 checkin_factory = factory.BuildFactory()
@@ -2711,7 +2745,7 @@ nightly_factory.addStep(trigger.Trigger(schedulerNames=['package-all-platforms']
                                      waitForFinish=True))
 @end example
 
-@node Merging BuildRequests, Setting the slaveport, Change Sources and Schedulers, Configuration
+@node Merging BuildRequests, Prioritizing Builders, Change Sources and Schedulers, Configuration
 @section Merging BuildRequests
 
 @bcindex c['mergeRequests']
@@ -2719,7 +2753,7 @@ nightly_factory.addStep(trigger.Trigger(schedulerNames=['package-all-platforms']
 By default, buildbot merges BuildRequests that have the compatible
 SourceStamps. This behaviour can be customized with the
 @code{c['mergeRequests']} configuration key.  This key specifies a function
-which is caleld with three arguments: a @code{Builder} and two
+which is called with three arguments: a @code{Builder} and two
 @code{BuildRequest} objects.  It should return true if the requests can be
 merged.  For example:
 
@@ -2742,7 +2776,38 @@ def mergeRequests(builder, req1, req2):
 c['mergeRequests'] = mergeRequests
 @end example
 
-@node Setting the slaveport, Buildslave Specifiers, Merging BuildRequests, Configuration
+@node Prioritizing Builders, Setting the slaveport, Merging BuildRequests, Configuration
+@section Prioritizing Builders
+
+@bcindex c['prioritizeBuilders']
+
+By default, buildbot will attempt to start builds on builders in order from the
+builder with the oldest pending request to the newest. This behaviour can be
+customized with the @code{c['prioritizeBuilders']} configuration key.
+This key specifies a function which is called with two arguments: a
+@code{BuildMaster} and a list of @code{Builder} objects. It
+should return a list of @code{Builder} objects in the desired order.
+It may also remove items from the list if builds should not be started
+on those builders.
+
+@example
+def prioritizeBuilders(buildmaster, builders):
+    """Prioritize builders.  'finalRelease' builds have the highest
+    priority, so they should be built before running tests, or
+    creating builds."""
+    builderPriorities = @{
+        "finalRelease": 0,
+        "test": 1,
+        "build": 2,
+    @}
+    builders.sort(key=lambda b: builderPriorities.get(b.name, 0))
+    return builders
+
+c['prioritizeBuilders'] = prioritizeBuilders
+@end example
+            
+
+@node Setting the slaveport, Buildslave Specifiers, Prioritizing Builders, Configuration
 @section Setting the slaveport
 
 @bcindex c['slavePortnum']
@@ -3205,7 +3270,7 @@ c['properties'] = @{
 @}
 @end example
 
-@node Defining Builders, Defining Status Targets, Defining Global Properties, Configuration
+@node Defining Builders
 @section Defining Builders
 
 @bcindex c['builders']
@@ -3282,10 +3347,26 @@ category, make your main status clients ignore them, and have only
 private status clients pick them up. As soon as they work, you can
 move them over to the active category.
 
+@item nextSlave
+If provided, this is a function that controls which slave will be assigned
+future jobs. The function is passed two arguments, the @code{Builder}
+object which is assigning a new job, and a list of @code{BuildSlave}
+objects. The function should return one of the @code{BuildSlave}
+objects, or @code{None} if none of the available slaves should be
+used.
+
+@item nextBuild
+If provided, this is a function that controls which build request will be
+handled next. The function is passed two arguments, the @code{Builder}
+object which is assigning a new job, and a list of @code{BuildRequest}
+objects of pending builds. The function should return one of the
+@code{BuildRequest} objects, or @code{None} if none of the pending
+builds should be started.
+
 @end table
 
 
-@node Defining Status Targets, Debug options, Defining Builders, Configuration
+@node Defining Status Targets
 @section Defining Status Targets
 
 The Buildmaster has a variety of ways to present build status to
@@ -3315,8 +3396,43 @@ c['status'].append(words.IRC(host="irc.example.com", nick="bb",
 Status delivery has its own chapter, @xref{Status Delivery}, in which
 all the built-in status targets are documented.
 
+@node Limiting Memory and Disk Usage
+@section Limiting Memory and Disk Usage
 
-@node Debug options,  , Defining Status Targets, Configuration
+Buildbot stores historical information on disk in the form of "Pickle" files
+and compressed logfiles.  In a large installation, these can quickly consume
+disk space, yet in many cases developers never consult this historical
+information.  Four configuration parameters control the "pruning" of various
+data, shown here with their default values:
+
+@bcindex c['buildHorizon']
+@bcindex c['eventHorizon']
+@bcindex c['logHorizon']
+@bcindex c['buildCacheSize']
+@example
+c['buildHorizon'] = 100
+c['eventHorizon'] = 50
+c['logHorizon'] = 40
+
+c['buildCacheSize'] = 15
+@end example
+
+The @code{buildHorizon} specifies the minimum number of builds for each builder
+which should be kept on disk.  The @code{eventHorizon} specifies the minumum
+number of events to keep -- events mostly describe connections and
+disconnections of slaves, and are seldom helpful to developers.  The
+@code{logHorizon} gives the minimum number of builds for which logs should be
+maintained; this parameter must be less than @code{buildHorizon}. Builds older
+than @code{logHorizon} but not older than @code{buildHorizon} will maintain
+their overall status and the status of each step, but the logfiles will be
+deleted.
+
+Finally, the @code{buildCacheSize} gives the number of builds for each builder
+which are cached in memory.  This number should be larger than the number of
+builds required for commonly-used status displays (the waterfall or grid
+views), so that those displays do not miss the cache on a refresh.
+
+@node Debug options
 @section Debug options
 
 
@@ -3801,6 +3917,12 @@ http://opensource.perlig.de/en/svnmailer/
 @ref{SVNCommitEmailMaildirSource}
 @end table
 
+@item Bzr
+@table @samp
+@item Launchpad
+@ref{BzrLaunchpadEmailMaildirSource}
+@end table
+
 @item Mercurial
 @table @samp
 @item NotifyExtension
@@ -3834,6 +3956,7 @@ done. Thus the prefix usually ends with a slash.
 * SyncmailMaildirSource::
 * BonsaiMaildirSource::
 * SVNCommitEmailMaildirSource::
+* BzrLaunchpadEmailMaildirSource::
 @end menu
 
 @node FCMaildirSource, SyncmailMaildirSource, Parsing Email Change Messages, Parsing Email Change Messages
@@ -3891,7 +4014,7 @@ from buildbot.changes.mail import BonsaiMaildirSource
 c['change_source'] = BonsaiMaildirSource("~/maildir-buildbot")
 @end example
 
-@node SVNCommitEmailMaildirSource,  , BonsaiMaildirSource, Parsing Email Change Messages
+@node SVNCommitEmailMaildirSource, BzrLaunchpadEmailMaildirSource, BonsaiMaildirSource, Parsing Email Change Messages
 @subsubsection SVNCommitEmailMaildirSource
 
 @csindex buildbot.changes.mail.SVNCommitEmailMaildirSource
@@ -3907,6 +4030,41 @@ it creates will be associated with the default (i.e. trunk) branch.
 from buildbot.changes.mail import SVNCommitEmailMaildirSource
 c['change_source'] = SVNCommitEmailMaildirSource("~/maildir-buildbot")
 @end example
+
+@node BzrLaunchpadEmailMaildirSource, , SVNCommitEmailMaildirSource, Parsing Email Change Messages
+@subsubsection BzrLaunchpadEmailMaildirSource
+
+@csindex buildbot.changes.mail.BzrLaunchpadEmailMaildirSource
+
+@code{BzrLaunchpadEmailMaildirSource} parses the mails that are sent to
+addresses that subscribe to branch revision notifications for a bzr branch
+hosted on Launchpad.
+
+The branch name defaults to @code{lp:<Launchpad path>}. For example
+@code{lp:~maria-captains/maria/5.1}.
+
+If only a single branch is used, the default branch name can be changed by
+setting @code{defaultBranch}.
+
+For multiple branches, pass a dictionary as the value of the @code{branchMap}
+option to map specific repository paths to specific branch names (see example
+below). The leading @code{lp:} prefix of the path is optional.
+
+The @code{prefix} option is not supported (it is silently ignored). Use the
+@code{branchMap} and @code{defaultBranch} instead to assign changes to
+branches (and just do not subscribe the buildbot to branches that are not of
+interest).
+
+The revision number is obtained from the email text. The bzr revision id is
+not available in the mails sent by Launchpad. However, it is possible to set
+the bzr @code{append_revisions_only} option for public shared repositories to
+avoid new pushes of merges changing the meaning of old revision numbers.
+
+@verbatim
+from buildbot.changes.mail import BzrLaunchpadEmailMaildirSource
+bm = { 'lp:~maria-captains/maria/5.1' : '5.1', 'lp:~maria-captains/maria/6.0' : '6.0' }
+c['change_source'] = BzrLaunchpadEmailMaildirSource("~/maildir-buildbot", branchMap = bm)
+@end verbatim
 
 
 @node PBChangeSource, P4Source, Mail-parsing ChangeSources, Getting Source Code Changes
@@ -4028,7 +4186,7 @@ branch name is simply the next path component, and the file is all path
 components after.
 
 @example
-import buildbot.changes.p4poller
+from buildbot.changes import p4poller
 s = p4poller.P4Source(p4base='//depot/project/',
                       split_file=lambda branchfile: branchfile.split('/',1),
                      )
@@ -4125,6 +4283,15 @@ installed in a weird place on your system (outside of the
 buildmaster's @code{$PATH}), use this to tell @code{SVNPoller} where
 to find it. The default value of ``svn'' will almost always be
 sufficient.
+
+@item revlinktmpl
+This parameter allows a link to be provided for each revision (for example,
+to websvn or viewvc).  These links appear anywhere changes are shown, such
+as on build or change pages.  The proper form for this parameter is an URL
+with the portion that will substitute for a revision number replaced by
+''%s''.  For example, @code{'http://myserver/websvn/revision.php?rev=%s'}
+could be used to cause revision links to be created to a websvn repository
+viewer.
 
 @end table
 
@@ -5032,6 +5199,10 @@ if specified, this will be passed to the @code{svn} binary with a
 @code{--password} option.  The password itself will be suitably obfuscated in
 the logs.
 
+@item extra_args
+if specified, an array of strings that will be passed as extra
+arguments to the @code{svn} binary.
+
 @end table
 
 If you are using branches, you must also make sure your
@@ -5182,7 +5353,7 @@ The @code{Mercurial} build step performs a
 @uref{http://selenic.com/mercurial, Mercurial} (aka ``hg'') checkout
 or update.
 
-Branches are available in two modes: ''dirname'' like @xref{Darcs} or
+Branches are available in two modes: ''dirname'' like @xref{Darcs}, or
 ''inrepo'', which uses the repository internal branches. Make sure this
 setting matches your changehook, if you have that installed.
 
@@ -5480,10 +5651,19 @@ their contents afterwards.
 The @code{logfiles=} argument allows you to collect data from these
 secondary logfiles in near-real-time, as the step is running. It
 accepts a dictionary which maps from a local Log name (which is how
-the log data is presented in the build results) to a remote filename
-(interpreted relative to the build's working directory). Each named
-file will be polled on a regular basis (every couple of seconds) as
-the build runs, and any new text will be sent over to the buildmaster.
+the log data is presented in the build results) to either a remote filename
+(interpreted relative to the build's working directory), or a dictionary
+of options. Each named file will be polled on a regular basis (every couple
+of seconds) as the build runs, and any new text will be sent over to the
+buildmaster.
+
+If you provide a dictionary of options instead of a string, you must specify
+the @code{filename} key. You can optionally provide a @code{follow} key which
+is a boolean controlling whether a logfile is followed or concatenated in its
+entirety.  Following is appropriate for logfiles to which the build step will
+append, where the pre-existing contents are not interesting.  The default value
+for @code{follow} is @code{False}, which gives the same behavior as just
+providing a string filename.
 
 @example
 f.addStep(ShellCommand(
@@ -5491,10 +5671,26 @@ f.addStep(ShellCommand(
               logfiles=@{"triallog": "_trial_temp/test.log"@}))
 @end example
 
+@example
+f.addStep(ShellCommand(
+              command=["make", "test"],
+              logfiles=@{"triallog": @{"filename": "_trial_temp/test.log",
+			       "follow": True,@}@}))
+@end example
+
+
+@item lazylogfiles
+If set to @code{True}, logfiles will be tracked lazily, meaning that they will
+only be added when and if something is written to them. This can be used to
+suppress the display of empty or missing log files. The default is @code{False}.
+
 
 @item timeout
 if the command fails to produce any output for this many seconds, it
 is assumed to be locked up and will be killed.
+
+@item maxTime
+if the command takes longer than this many seconds, it will be killed.
 
 @item description
 This will be used to describe the command (on the Waterfall display)
@@ -5542,6 +5738,7 @@ file less verbose.
 * Test::
 * TreeSize::
 * PerlModuleTest::
+* Testing with mysql-test-run::
 * SetProperty::
 @end menu
 
@@ -5585,6 +5782,66 @@ The @code{warningPattern=} can also be a pre-compiled python regexp
 object: this makes it possible to add flags like @code{re.I} (to use
 case-insensitive matching).
 
+The @code{suppressionFile=} argument can be specified as the (relative) path
+of a file inside the workdir defining warnings to be suppressed from the
+warning counting and log file. The file will be uploaded to the master from
+the slave before compiling, and any warning matched by a line in the
+suppression file will be ignored. This is useful to accept certain warnings
+(eg. in some special module of the source tree or in cases where the compiler
+is being particularly stupid), yet still be able to easily detect and fix the
+introduction of new warnings.
+
+The file must contain one line per pattern of warnings to ignore. Empty lines
+and lines beginning with @code{#} are ignored. Other lines must consist of a
+regexp matching the file name, followed by a colon (@code{:}), followed by a
+regexp matching the text of the warning. Optionally this may be followed by
+another colon and a line number range. For example:
+
+@example
+# Sample warning suppression file
+
+mi_packrec.c : .*result of 32-bit shift implicitly converted to 64 bits.* : 560-600
+DictTabInfo.cpp : .*invalid access to non-static.*
+kernel_types.h : .*only defines private constructors and has no friends.* : 51
+@end example
+
+If no line number range is specified, the pattern matches the whole file; if
+only one number is given it matches only on that line.
+
+The default warningPattern regexp only matches the warning text, so line
+numbers and file names are ignored. To enable line number and file name
+matching, privide a different regexp and provide a function (callable) as the
+argument of @code{warningExtractor=}. The function is called with three
+arguments: the BuildStep object, the line in the log file with the warning,
+and the @code{SRE_Match} object of the regexp search for @code{warningPattern}. It
+should return a tuple @code{(filename, linenumber, warning_test)}. For
+example:
+
+@example
+f.addStep(Compile(command=["make"],
+                  warningPattern="^(.*?):([0-9]+): [Ww]arning: (.*)$",
+                  warningExtractor=Compile.warnExtractFromRegexpGroups,
+                  suppressionFile="support-files/compiler_warnings.supp"))
+@end example
+
+(@code{Compile.warnExtractFromRegexpGroups} is a pre-defined function that
+returns the filename, linenumber, and text from groups (1,2,3) of the regexp
+match).
+
+In projects with source files in multiple directories, it is possible to get
+full path names for file names matched in the suppression file, as long as the
+build command outputs the names of directories as they are entered into and
+left again. For this, specify regexps for the arguments
+@code{directoryEnterPattern=} and @code{directoryLeavePattern=}. The
+@code{directoryEnterPattern=} regexp should return the name of the directory
+entered into in the first matched group. The defaults, which are suitable for
+GNU Make, are these:
+
+@example
+directoryEnterPattern = "make.*: Entering directory [\"`'](.*)['`\"]"
+directoryLeavePattern = "make.*: Leaving directory"
+@end example
+
 (TODO: this step needs to be extended to look for GCC error messages
 as well, and collect them into a separate logfile, along with the
 source code filenames involved).
@@ -5608,7 +5865,7 @@ of the code tree. It puts the size (as a count of 1024-byte blocks,
 aka 'KiB' or 'kibibytes') on the step's status text, and sets a build
 property named 'tree-size-KiB' with the same value.
 
-@node PerlModuleTest, SetProperty, TreeSize, Simple ShellCommand Subclasses
+@node PerlModuleTest, Testing with mysql-test-run, TreeSize, Simple ShellCommand Subclasses
 @subsubsection PerlModuleTest
 
 @bsindex buildbot.steps.shell.PerlModuleTest
@@ -5617,7 +5874,95 @@ This is a simple command that knows how to run tests of perl modules.
 It parses the output to determine the number of tests passed and
 failed and total number executed, saving the results for later query.
 
-@node SetProperty,  , PerlModuleTest, Simple ShellCommand Subclasses
+@node Testing with mysql-test-run, SetProperty, PerlModuleTest, Simple ShellCommand Subclasses
+@subsection Testing with mysql-test-run
+
+The @code{process.mtrlogobserver.MTR} class is a subclass of @code{Test}
+(@ref{Test}). It is used to run test suites using the mysql-test-run program,
+as used in MySQL, Drizzle, MariaDB, and MySQL storage engine plugins.
+
+The shell command to run the test suite is specified in the same way as for
+the Test class. The MTR class will parse the output of running the test suite,
+and use the count of tests executed so far to provide more accurate completion
+time estimates. Any test failures that occur during the test are summarized on
+the Waterfall Display.
+
+Server error logs are added as additional log files, useful to debug test
+failures.
+
+Optionally, data about the test run and any test failures can be inserted into
+a database for further analysis and report generation. To use this facility,
+create an instance of @code{twisted.enterprise.adbapi.ConnectionPool} with
+connections to the database. The necessary tables can be created automatically
+by setting @code{autoCreateTables} to @code{True}, or manually using the SQL
+found in the @file{mtrlogobserver.py} source file.
+
+One problem with specifying a database is that each reload of the
+configuration will get a new instance of @code{ConnectionPool} (even if the
+connection parameters are the same). To avoid that Buildbot thinks the builder
+configuration has changed because of this, use the
+@code{process.mtrlogobserver.EqConnectionPool} subclass of
+@code{ConnectionPool}, which implements an equiality operation that avoids
+this problem.
+
+Example use:
+
+@example
+from buildbot.process.mtrlogobserver import MTR, EqConnectionPool
+myPool = EqConnectionPool("MySQLdb", "host", "buildbot", "password", "db")
+myFactory.addStep(MTR(workdir="mysql-test", dbpool=myPool,
+                      command=["perl", "mysql-test-run.pl", "--force"]))
+@end example
+
+@code{MTR} arguments:
+
+@table @code
+
+@item textLimit
+Maximum number of test failures to show on the waterfall page (to not flood
+the page in case of a large number of test failures. Defaults to 5.
+
+@item testNameLimit
+Maximum length of test names to show unabbreviated in the waterfall page, to
+avoid excessive column width. Defaults to 16.
+
+@item parallel
+Value of @code{--parallel} option used for mysql-test-run.pl (number of processes
+used to run the test suite in parallel). Defaults to 4. This is used to
+determine the number of server error log files to download from the
+slave. Specifying a too high value does not hurt (as nonexisting error logs
+will be ignored), however if using @code{--parallel} value greater than the default
+it needs to be specified, or some server error logs will be missing.
+
+@item dbpool
+An instance of twisted.enterprise.adbapi.ConnectionPool, or None.  Defaults to
+None. If specified, results are inserted into the database using the
+ConnectionPool.
+
+@item autoCreateTables
+Boolean, defaults to False. If True (and @code{dbpool} is specified), the
+necessary database tables will be created automatically if they do not exist
+already. Alternatively, the tables can be created manually from the SQL
+statements found in the mtrlogobserver.py source file.
+
+@item test_type
+Short string that will be inserted into the database in the row for the test
+run. Defaults to the empty string, but can be specified to identify different
+types of test runs.
+
+@item test_info
+Descriptive string that will be inserted into the database in the row for the test
+run. Defaults to the empty string, but can be specified as a user-readable
+description of this particular test run.
+
+@item mtr_subdir
+The subdirectory in which to look for server error log files. Defaults to
+``mysql-test'', which is usually correct. WithProperties is supported.
+
+@end table
+
+
+@node SetProperty,  , Testing with mysql-test-run, Simple ShellCommand Subclasses
 @subsubsection SetProperty
 
 @bsindex buildbot.steps.shell.SetProperty
@@ -5803,7 +6148,7 @@ side:
 
 @example
 from buildbot.steps.shell import ShellCommand
-from buildbot.steps.transfer import FileUpload
+from buildbot.steps.transfer import FileDownload
 
 f.addStep(FileDownload(mastersrc="~/todays_build_config.txt",
                        slavedest="build_config.txt"))
@@ -5900,7 +6245,7 @@ from buildbot.steps.trigger import Trigger
 f.addStep(Trigger(schedulerNames=['build-prep'],
                   waitForFinish=True,
                   updateSourceStamp=True,
-                  set_properties={ 'quick' : False },
+                  set_properties=@{ 'quick' : False @},
                   copy_properties=[ 'release_code_name' ]))
 @end example
 
@@ -6916,7 +7261,7 @@ Example:
 
 @example
 # use the s() convenience function defined earlier
-f = factory.GNUAutoconf(source=s(step.SVN, svnurl=URL, mode="copy"),
+f = factory.GNUAutoconf(source=s(source.SVN, svnurl=URL, mode="copy"),
                         flags=["--disable-nls"])
 @end example
 
@@ -7095,17 +7440,6 @@ changed functionality.
 
 Arguments:
 @table @code
-@item source
-(required): A step specification tuple, like that used by GNUAutoconf.
-
-@item buildpython
-A list (argv array) of strings which specifies the @code{python}
-executable to use when building the package. Defaults to just
-@code{['python']}. It may be useful to add flags here, to supress
-warnings during compilation of extension modules. This list is
-extended with @code{['./setup.py', 'build']} and then executed in a
-ShellCommand.
-
 @item testpath
 Provides a directory to add to @code{PYTHONPATH} when running the unit
 tests, if tests are being run. Defaults to @code{.} to include the
@@ -7113,15 +7447,14 @@ project files in-place. The generated build library is frequently
 architecture-dependent, but may simply be @file{build/lib} for
 pure-python modules.
 
-@item trialpython
-Another list of strings used to build the command that actually runs
-trial. This is prepended to the contents of the @code{trial} argument
-below. It may be useful to add @code{-W} flags here to supress
-warnings that occur while tests are being run. Defaults to an empty
-list, meaning @code{trial} will be run without an explicit
-interpreter, which is generally what you want if you're using
-@file{/usr/bin/trial} instead of, say, the @file{./bin/trial} that
-lives in the Twisted source tree.
+@item python
+which python executable to use. This list will form the start of
+the argv array that will launch trial. If you use this,
+you should set @code{trial} to an explicit path (like
+@code{/usr/bin/trial} or @code{./bin/trial}). The parameter defaults to @code{None}, which
+leaves it out entirely (running @code{trial args} instead of
+@code{python ./bin/trial args}). Likely values are @code{['python']},
+@code{['python2.2']}, or @code{['python', '-Wall']}.
 
 @item trial
 provides the name of the @code{trial} command. It is occasionally
@@ -7129,83 +7462,46 @@ useful to use an alternate executable, such as @code{trial2.2} which
 might run the tests under an older version of Python. Defaults to
 @code{trial}.
 
+@item trialMode
+a list of arguments to pass to trial, specifically to set the reporting mode.
+This defaults to @code{['--reporter=bwverbose']}, which only works for
+Twisted-2.1.0 and later.
+
+@item trialArgs
+a list of arguments to pass to trial, available to turn on any extra flags you
+like. Defaults to @code{[]}.
+
 @item tests
 Provides a module name or names which contain the unit tests for this
 project. Accepts a string, typically @code{PROJECTNAME.test}, or a
 list of strings. Defaults to None, indicating that no tests should be
-run. You must either set this or @code{useTestCaseNames} to do anyting
-useful with the Trial factory.
+run. You must either set this or @code{testChanges}.
 
-@item useTestCaseNames
-Tells the Step to provide the names of all changed .py files to trial,
-so it can look for test-case-name tags and run just the matching test
-cases. Suitable for use in quick builds. Defaults to False.
+@item testChanges
+if True, ignore the @code{tests} parameter and instead ask the Build for all
+the files that make up the Changes going into this build. Pass these filenames
+to trial and ask it to look for test-case-name tags, running just the tests
+necessary to cover the changes.
+
+@item recurse
+If @code{True}, tells Trial (with the @code{--recurse} argument) to look in all
+subdirectories for additional test cases. 
+
+@item reactor
+which reactor to use, like 'gtk' or 'java'. If not provided, the Twisted's
+usual platform-dependent default is used.
 
 @item randomly
 If @code{True}, tells Trial (with the @code{--random=0} argument) to
 run the test cases in random order, which sometimes catches subtle
 inter-test dependency bugs. Defaults to @code{False}.
-
-@item recurse
-If @code{True}, tells Trial (with the @code{--recurse} argument) to
-look in all subdirectories for additional test cases. It isn't clear
-to me how this works, but it may be useful to deal with the
-unknown-PROJECTNAME problem described above, and is currently used in
-the Twisted buildbot to accomodate the fact that test cases are now
-distributed through multiple twisted.SUBPROJECT.test directories.
-
 @end table
 
-Unless one of @code{trialModule} or @code{useTestCaseNames}
-are set, no tests will be run.
+The step can also take any of the @code{ShellCommand} arguments, e.g.,
+@code{haltOnFailure}.
 
-Some quick examples follow. Most of these examples assume that the
-target python code (the ``code under test'') can be reached directly
-from the root of the target tree, rather than being in a @file{lib/}
-subdirectory.
-
-@example
-#  Trial(source, tests="toplevel.test") does:
-#   python ./setup.py build
-#   PYTHONPATH=. trial -to toplevel.test
-
-#  Trial(source, tests=["toplevel.test", "other.test"]) does:
-#   python ./setup.py build
-#   PYTHONPATH=. trial -to toplevel.test other.test
-
-#  Trial(source, useTestCaseNames=True) does:
-#   python ./setup.py build
-#   PYTHONPATH=. trial -to --testmodule=foo/bar.py..  (from Changes)
-
-#  Trial(source, buildpython=["python2.3", "-Wall"], tests="foo.tests"):
-#   python2.3 -Wall ./setup.py build
-#   PYTHONPATH=. trial -to foo.tests
-
-#  Trial(source, trialpython="python2.3", trial="/usr/bin/trial",
-#        tests="foo.tests") does:
-#   python2.3 -Wall ./setup.py build
-#   PYTHONPATH=. python2.3 /usr/bin/trial -to foo.tests
-
-# For running trial out of the tree being tested (only useful when the
-# tree being built is Twisted itself):
-#  Trial(source, trialpython=["python2.3", "-Wall"], trial="./bin/trial",
-#        tests="foo.tests") does:
-#   python2.3 -Wall ./setup.py build
-#   PYTHONPATH=. python2.3 -Wall ./bin/trial -to foo.tests
-@end example
-
-If the output directory of @code{./setup.py build} is known, you can
-pull the python code from the built location instead of the source
-directories. This should be able to handle variations in where the
-source comes from, as well as accomodating binary extension modules:
-
-@example
-# Trial(source,tests="toplevel.test",testpath='build/lib.linux-i686-2.3')
-# does:
-#  python ./setup.py build
-#  PYTHONPATH=build/lib.linux-i686-2.3 trial -to toplevel.test
-@end example
-
+Unless one of @code{tests} or @code{testChanges} are set, the step will
+generate an exception.
 
 @node Status Delivery, Command-line tool, Build Process, Top
 @chapter Status Delivery
@@ -7265,6 +7561,11 @@ logs and source changes. By simply reloading this page on a regular
 basis, you will see a complete description of everything the buildbot
 is currently working on.
 
+A similar, but more developer-oriented display is the "Grid" display.  This
+arranges builds by SourceStamp (horizontal axis) and builder (vertical axis),
+and can provide quick information as to which revisions are passing or failing
+on which builders.
+
 There are also pages with more specialized information. For example,
 there is a page which shows the last 20 builds performed by the
 buildbot, one line each. Each line is a link to detailed information
@@ -7318,12 +7619,13 @@ they provide.
 
 @menu
 * WebStatus Configuration Parameters::
+* Enabling the "Force Build" Button::
 * Buildbot Web Resources::
 * XMLRPC server::
 * HTML Waterfall::
 @end menu
 
-@node WebStatus Configuration Parameters, Buildbot Web Resources, WebStatus, WebStatus
+@node WebStatus Configuration Parameters
 @subsection WebStatus Configuration Parameters
 
 The most common way to run a @code{WebStatus} is on a regular TCP
@@ -7365,20 +7667,23 @@ configuration will make the HTML status page available at
 appear at @code{http://host/buildbot/}, and the right virtual host
 setup can even place it at @code{http://buildbot.host/} .
 
-The other @code{WebStatus} argument is @code{allowForce}. If set to
-True, then the web page will provide a ``Force Build'' button that
-allows visitors to manually trigger builds. This is useful for
-developers to re-run builds that have failed because of intermittent
-problems in the test suite, or because of libraries that were not
-installed at the time of the previous build. The default value is False.
+@node Enabling the "Force Build" Button
+@subsection Enabling the "Force Build" Button
 
-You may not wish to allow strangers to cause a build to run or to stop
-current builds, in that case you can pass an instance of
-@code{status.web.authentication.IAuth} as a @code{auth} keyword argument.
-The class @code{BasicAuth} implements a basic authentication mechanism
-using a list of user/password tuples provided from the configuration file.
-The class @code{HTPasswdAuth} implements an authentication against an
-@file{.htpasswd} file.
+An important @code{WebStatus} argument is @code{allowForce}. If set to True,
+then the web page will provide a ``Force Build'' button that allows visitors to
+manually trigger builds. This is useful for developers to re-run builds that
+have failed because of intermittent problems in the test suite, or because of
+libraries that were not installed at the time of the previous build. The
+default value is False, since it also allows anyone with a web browser to waste
+computing resources forcing unnecessary builds.
+
+If you do not wish to allow strangers to cause a build to run or to stop
+current builds, pass an instance of @code{status.web.authentication.IAuth} as a
+@code{auth} keyword argument to @code{WebStatus}.  The class @code{BasicAuth}
+implements a basic authentication mechanism using a list of user/password
+tuples provided from the configuration file.  The class @code{HTPasswdAuth}
+implements an authentication against an @file{.htpasswd} file.
 
 @example
 from buildbot.status.html import WebStatus
@@ -7391,8 +7696,7 @@ file = '/path/to/file'
 c['status'].append(WebStatus(http_port=8080, auth=(HTPasswdAuth(file))))
 @end example
 
-
-@node Buildbot Web Resources, XMLRPC server, WebStatus Configuration Parameters, WebStatus
+@node Buildbot Web Resources
 @subsection Buildbot Web Resources
 
 Certain URLs are ``magic'', and the pages they serve are created by
@@ -7453,6 +7757,12 @@ non-Build events, like slaves attaching and detaching, as well as
 reconfiguration events. 'show_events=false' hides these events. The
 default is to show them.
 
+By adding the 'failures_only=true' query argument, the Waterfall is
+restricted to only showing information about the builders that
+are currently failing. A builder is considered failing if the
+last finished build was not successful, a step in the current
+build(s) is failing, or if the builder is offline.
+
 The @code{last_time=}, @code{first_time=}, and @code{show_time=}
 arguments will control what interval of time is displayed. The default
 is to show the latest events, but these can be used to look at earlier
@@ -7473,10 +7783,10 @@ and the revisions are listed across the top.
 By adding one ore more ``category='' arguments the grid will be
 restricted to revisions in those categories.
 
-A ``width=N'' argument will limit the number of revisiosn shown to N,
+A ``width=N'' argument will limit the number of revisions shown to N,
 defaulting to 5.
 
-A ``branch=BRANCHNAME'' argument will limit the grid to revisiosn on
+A ``branch=BRANCHNAME'' argument will limit the grid to revisions on
 branch BRANCHNAME.
 
 @item /tgrid
@@ -7486,6 +7796,40 @@ implies, transposes the grid: the revisions are listed down the left side
 of the page, and the build hosts are listed across the top.  It accepts
 the same query arguments. The exception being that instead of ``width''
 the argument is named ``length.''
+
+@item /console
+
+EXPERIMENTAL: This provides a developer-oriented display of the the last
+changes and how they affected the builders.
+
+It allows a developer to quickly see the status of each builder for the
+first build including his or her change. A green box means that the change
+succeeded for all the steps for a given builder. A red box means that
+the changed introduced a new regression on a builder. An orange box
+means that at least one of the test failed, but it was also failing
+in the previous build, so it is not possible to see if there was any
+regressions from this change. Finally a yellow box means that the test
+is in progress.
+
+By adding one or more ``builder='' query arguments, the Console view is
+restricted to only showing information about the given Builders. By
+adding one or more ``branch='' query arguments, the display is
+restricted to showing information about the given branches. In
+addition, adding one or more ``category='' query arguments to the URL
+will limit the display to Builders that were defined with one of the
+given categories.
+
+By adding one or more ``name='' query arguments, the console view is
+restricted to only showing changes made by the given users.
+
+NOTE: To use this page, your buildbot.css file in public_html
+must be the one found in buildbot/status/web/extended.css.
+
+The console view is still in development. At this moment it supports
+only the source control managers that have an integer based revision id,
+like svn. It also has some issues with displaying multiple braches at the
+same time. If you do have multiple branches, you should use the
+``branch='' query argument.
 
 @item /rss
 
@@ -7498,6 +7842,11 @@ feed output.
 This provides an atom feed summarizing all failed builds. The same
 query-arguments used by 'waterfall' can be added to filter the feed
 output.
+
+@item /buildstatus?builder=$BUILDERNAME&number=$BUILDNUM
+
+This displays a waterfall-like chronologically-oriented view of all the
+steps for a given build number on a given builder.
 
 @item /builders/$BUILDERNAME
 
@@ -7901,6 +8250,11 @@ the above information formatted.
 log contents as a list of strings, and the status of the corresponding build step,
 i.e. SUCCESS, WARNING, or FAILURE.
 @end table
+
+@item extraHeaders
+(dictionary) A dictionary containing key/value pairs of extra headers to add
+to sent e-mails. Both the keys and the values may be a WithProperties instance.
+
 @end table
 
 @node IRC Bot, PBListener, MailNotifier, Status Delivery
@@ -8505,7 +8859,7 @@ SHA1 hash of the current revision's contents), which is used as the
 base revision. @code{hg diff} then provides the patch relative to that
 revision. For @command{try} to work, your working directory must only
 have patches that are available from the same remotely-available
-repository that the build process' @code{step.Mercurial} will use.
+repository that the build process' @code{source.Mercurial} will use.
 
 @item Git
 @code{git branch -v} lists all the branches available in the local
@@ -8628,6 +8982,11 @@ output of @command{darcs changes --context} as a revision specifier.
 This context file can be a couple of kilobytes long, spanning a couple
 lines per patch, and would be a hassle to pass as a command-line
 argument.
+
+@item --property
+This parameter is used to set a property on the Change generated by sendchange.
+Properties are specified as a name:value pair, separated by a colon. You may
+specify many properties by passing this parameter multiple times.
 
 @item --comments
 This provides the change comments as a single argument. You may want
@@ -8796,7 +9155,7 @@ command to wait for the requested build to complete.
 @node Resources, Developer's Appendix, Command-line tool, Top
 @chapter Resources
 
-The Buildbot's home page is at @uref{http://buildbot.sourceforge.net/}
+The Buildbot home page is @uref{http://buildbot.net/}.
 
 For configuration questions and general discussion, please use the
 @code{buildbot-devel} mailing list. The subscription instructions and

@@ -1,4 +1,3 @@
-
 import sys, os, time
 from cPickle import dump
 
@@ -9,6 +8,7 @@ from twisted.application import service
 from twisted.web import html
 
 from buildbot import interfaces, util
+from buildbot.process.properties import Properties
 
 html_tmpl = """
 <p>Changed by: <b>%(who)s</b><br />
@@ -23,6 +23,9 @@ Changed files:
 
 Comments:
 %(comments)s
+
+Properties:
+%(properties)s
 </p>
 """
 
@@ -50,16 +53,18 @@ class Change:
 
     number = None
 
-    links = []
     branch = None
+    category = None
     revision = None # used to create a source-stamp
 
-    def __init__(self, who, files, comments, isdir=0, links=[],
-                 revision=None, when=None, branch=None, repository=None,
-                 category=None):
+    def __init__(self, who, files, comments, isdir=0, links=None,
+                 revision=None, when=None, branch=None, category=None,
+                 repository=None, revlink='', properties={}):
         self.who = who
         self.comments = comments
         self.isdir = isdir
+        if links is None:
+            links = []
         self.links = links
         self.revision = revision
         if when is None:
@@ -68,18 +73,28 @@ class Change:
         self.branch = branch
         self.repository = repository
         self.category = category
+        self.revlink = revlink
+        self.properties = Properties()
+        self.properties.update(properties, "Change")
 
         # keep a sorted list of the files, for easier display
         self.files = files[:]
         self.files.sort()
 
+    def __setstate__(self, dict):
+        self.__dict__ = dict
+        # Older Changes won't have a 'properties' attribute in them
+        if not hasattr(self, 'properties'):
+            self.properties = Properties()
+
     def asText(self):
         data = ""
-        data += self.getFileContents() 
+        data += self.getFileContents()
         data += "At: %s\n" % self.getTime()
         data += "Changed By: %s\n" % self.who
         data += "Repository: %s\n" % self.repository
-        data += "Comments: %s\n\n" % self.comments
+        data += "Comments: %s" % self.comments
+        data += "Properties: \n%s\n\n" % self.getProperties()
         return data
 
     def asHTML(self):
@@ -91,15 +106,25 @@ class Change:
                 links.append('<a href="%s"><b>%s</b></a>' % (link[0], file))
             else:
                 links.append('<b>%s</b>' % file)
-        revision = ""
         if self.revision:
-            revision = "Revision: <b>%s</b><br />\n" % self.revision
+            if getattr(self, 'revlink', ""):
+                revision = 'Revision: <a href="%s"><b>%s</b></a>\n' % (
+                        self.revlink, self.revision)
+            else:
+                revision = "Revision: <b>%s</b><br />\n" % self.revision
+        else:
+            revision = ''
         repository = ""
         if self.repository:
             repository = "Repository: <b>%s</b><br />\n" % self.repository
+
         branch = ""
         if self.branch:
             branch = "Branch: <b>%s</b><br />\n" % self.branch
+
+        properties = []
+        for prop in self.properties.asList():
+            properties.append("%s: %s<br />" % (prop[0], prop[1]))
 
         kwargs = { 'who'       : html.escape(self.who),
                    'at'        : self.getTime(),
@@ -107,7 +132,8 @@ class Change:
                    'revision'  : revision,
                    'repository': repository,
                    'branch'    : branch,
-                   'comments'  : html.PRE(self.comments) }
+                   'comments'  : html.PRE(self.comments),
+                   'properties': html.UL(properties) + '\n' }
         return html_tmpl % kwargs
 
     def get_HTML_box(self, url):
@@ -159,7 +185,13 @@ class Change:
             for f in self.files:
                 data += " %s\n" % f
         return data
-        
+
+    def getProperties(self):
+        data = ""
+        for prop in self.properties.asList():
+            data += "  %s: %s" % (prop[0], prop[1])
+        return data
+
 class ChangeMaster(service.MultiService):
 
     """This is the master-side service which receives file change
@@ -182,7 +214,7 @@ class ChangeMaster(service.MultiService):
     objects.
 
     There are several different variants of the second type of source:
-    
+
       - L{buildbot.changes.mail.MaildirSource} watches a maildir for CVS
         commit mail. It uses DNotify if available, or polls every 10
         seconds if not.  It parses incoming mail to determine what files
@@ -191,13 +223,15 @@ class ChangeMaster(service.MultiService):
       - L{buildbot.changes.freshcvs.FreshCVSSource} makes a PB
         connection to the CVSToys 'freshcvs' daemon and relays any
         changes it announces.
-    
+
     """
 
     implements(interfaces.IEventSource)
 
     debug = False
     # todo: use Maildir class to watch for changes arriving by mail
+
+    changeHorizon = 0
 
     def __init__(self):
         service.MultiService.__init__(self)
@@ -231,15 +265,18 @@ class ChangeMaster(service.MultiService):
         self.nextNumber += 1
         self.changes.append(change)
         self.parent.addChange(change)
-        # TODO: call pruneChanges after a while
+        self.pruneChanges()
 
     def pruneChanges(self):
-        self.changes = self.changes[-100:] # or something
+        if self.changeHorizon and len(self.changes) > self.changeHorizon:
+            log.msg("pruning %i changes" % (len(self.changes) - self.changeHorizon))
+            self.changes = self.changes[-self.changeHorizon:]
 
-    def eventGenerator(self, branches=[]):
+    def eventGenerator(self, branches=[], categories=[]):
         for i in range(len(self.changes)-1, -1, -1):
             c = self.changes[i]
-            if not branches or c.branch in branches:
+            if (not branches or c.branch in branches) and (
+                not categories or c.category in categories):
                 yield c
 
     def getChangeNumbered(self, num):

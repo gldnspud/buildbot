@@ -18,7 +18,10 @@ def naturalSort(l):
             return s
     def key_func(item):
         return [try_int(s) for s in re.split('(\d+)', item)]
-    l.sort(key=key_func)
+    # prepend integer keys to each element, sort them, then strip the keys
+    keyed_l = [ (key_func(i), i) for i in l ]
+    keyed_l.sort()
+    l = [ i[1] for i in keyed_l ]
     return l
 
 def now():
@@ -100,3 +103,9 @@ class ComparableMixin:
         self_list= [getattr(self, name, _None) for name in self.compare_attrs]
         them_list= [getattr(them, name, _None) for name in self.compare_attrs]
         return cmp(self_list, them_list)
+
+def to_text(s):
+    if isinstance(s, (str, unicode)):
+        return s
+    else:
+        return str(s)

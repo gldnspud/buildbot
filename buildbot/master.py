@@ -11,6 +11,7 @@ import warnings
 
 from zope.interface import implements
 from twisted.python import log, components
+from twisted.python.failure import Failure
 from twisted.internet import defer, reactor
 from twisted.spread import pb
 from twisted.cred import portal, checkers
@@ -65,6 +66,10 @@ class BotMaster(service.MultiService):
         # self.mergeRequests is the callable override for merging build
         # requests
         self.mergeRequests = None
+
+        # self.prioritizeBuilders is the callable override for builder order
+        # traversal
+        self.prioritizeBuilders = None
 
     # these four are convenience functions for testing
 
@@ -194,19 +199,31 @@ class BotMaster(service.MultiService):
 
     def maybeStartAllBuilds(self):
         builders = self.builders.values()
-        def _sortfunc(b1, b2):
-            t1 = b1.getOldestRequestTime()
-            t2 = b2.getOldestRequestTime()
-            # If t1 or t2 is None, then there are no build requests,
-            # so sort it at the end
-            if t1 is None:
-                return 1
-            if t2 is None:
-                return -1
-            return cmp(t1, t2)
-        builders.sort(cmp=_sortfunc)
-        for b in builders:
-            b.maybeStartBuild()
+        if self.prioritizeBuilders is not None:
+            try:
+                builders = self.prioritizeBuilders(self.parent, builders)
+            except:
+                log.msg("Exception prioritizing builders")
+                log.err(Failure())
+                return
+        else:
+            def _sortfunc(b1, b2):
+                t1 = b1.getOldestRequestTime()
+                t2 = b2.getOldestRequestTime()
+                # If t1 or t2 is None, then there are no build requests,
+                # so sort it at the end
+                if t1 is None:
+                    return 1
+                if t2 is None:
+                    return -1
+                return cmp(t1, t2)
+            builders.sort(_sortfunc)
+        try:
+            for b in builders:
+                b.maybeStartBuild()
+        except:
+            log.msg("Exception starting builds")
+            log.err(Failure())
 
     def shouldMergeRequests(self, builder, req1, req2):
         """Determine whether two BuildRequests should be merged for
@@ -523,10 +540,12 @@ class BuildMaster(service.MultiService, styles.Versioned):
 
         known_keys = ("bots", "slaves",
                       "sources", "change_source",
-                      "schedulers", "builders", "mergeRequests", 
+                      "schedulers", "builders", "mergeRequests",
                       "slavePortnum", "debugPassword", "logCompressionLimit",
                       "manhole", "status", "projectName", "projectURL",
-                      "buildbotURL", "properties"
+                      "buildbotURL", "properties", "prioritizeBuilders",
+                      "eventHorizon", "buildCacheSize", "logHorizon", "buildHorizon",
+                      "changeHorizon", "logMaxSize", "logMaxTailSize",
                       )
         for k in config.keys():
             if k not in known_keys:
@@ -555,13 +574,31 @@ class BuildMaster(service.MultiService, styles.Versioned):
             projectURL = config.get('projectURL')
             buildbotURL = config.get('buildbotURL')
             properties = config.get('properties', {})
-            logCompressionLimit = config.get('logCompressionLimit')
+            buildCacheSize = config.get('buildCacheSize', None)
+            eventHorizon = config.get('eventHorizon', None)
+            logHorizon = config.get('logHorizon', None)
+            buildHorizon = config.get('buildHorizon', None)
+            logCompressionLimit = config.get('logCompressionLimit', 4*1024)
             if logCompressionLimit is not None and not \
                     isinstance(logCompressionLimit, int):
                 raise ValueError("logCompressionLimit needs to be bool or int")
+            logMaxSize = config.get('logMaxSize')
+            if logMaxSize is not None and not \
+                    isinstance(logMaxSize, int):
+                raise ValueError("logMaxSize needs to be None or int")
+            logMaxTailSize = config.get('logMaxTailSize')
+            if logMaxTailSize is not None and not \
+                    isinstance(logMaxTailSize, int):
+                raise ValueError("logMaxTailSize needs to be None or int")
             mergeRequests = config.get('mergeRequests')
             if mergeRequests is not None and not callable(mergeRequests):
                 raise ValueError("mergeRequests must be a callable")
+            prioritizeBuilders = config.get('prioritizeBuilders')
+            if prioritizeBuilders is not None and not callable(prioritizeBuilders):
+                raise ValueError("prioritizeBuilders must be callable")
+            changeHorizon = config.get("changeHorizon")
+            if changeHorizon is not None and not isinstance(changeHorizon, int):
+                raise ValueError("changeHorizon needs to be an int")
 
         except KeyError, e:
             log.msg("config dictionary is missing a required parameter")
@@ -587,6 +624,9 @@ class BuildMaster(service.MultiService, styles.Versioned):
 
         #if "sources" in config:
         #    raise KeyError("c['sources'] is no longer accepted")
+
+        if changeHorizon is not None:
+            self.change_svc.changeHorizon = changeHorizon
 
         change_source = config.get('change_source', [])
         if isinstance(change_source, (list, tuple)):
@@ -718,10 +758,27 @@ class BuildMaster(service.MultiService, styles.Versioned):
 
         self.properties = Properties()
         self.properties.update(properties, self.configFileName)
-        if logCompressionLimit is not None:
-            self.status.logCompressionLimit = logCompressionLimit
+
+        self.status.logCompressionLimit = logCompressionLimit
+        self.status.logMaxSize = logMaxSize
+        self.status.logMaxTailSize = logMaxTailSize
+        # Update any of our existing builders with the current log parameters.
+        # This is required so that the new value is picked up after a
+        # reconfig.
+        for builder in self.botmaster.builders.values():
+            builder.builder_status.setLogCompressionLimit(logCompressionLimit)
+            builder.builder_status.setLogMaxSize(logMaxSize)
+            builder.builder_status.setLogMaxTailSize(logMaxTailSize)
+
         if mergeRequests is not None:
             self.botmaster.mergeRequests = mergeRequests
+        if prioritizeBuilders is not None:
+            self.botmaster.prioritizeBuilders = prioritizeBuilders
+
+        self.buildCacheSize = buildCacheSize
+        self.eventHorizon = eventHorizon
+        self.logHorizon = logHorizon
+        self.buildHorizon = buildHorizon
 
         # self.slaves: Disconnect any that were attached and removed from the
         # list. Update self.checker with the new list of passwords, including
@@ -800,6 +857,8 @@ class BuildMaster(service.MultiService, styles.Versioned):
         # shut down any that were removed, start any that were added
         deleted_sources = [s for s in self.change_svc if s not in sources]
         added_sources = [s for s in sources if s not in self.change_svc]
+        log.msg("adding %d new changesources, removing %d" %
+                (len(added_sources), len(deleted_sources)))
         dl = [self.change_svc.removeSource(s) for s in deleted_sources]
         def addNewOnes(res):
             [self.change_svc.addSource(s) for s in added_sources]
@@ -893,6 +952,12 @@ class BuildMaster(service.MultiService, styles.Versioned):
                 log.msg("builder %s is unchanged" % name)
                 pass
 
+        # regardless of whether anything changed, get each builder status
+        # to update its config
+        for builder in allBuilders.values():
+            builder.builder_status.reconfigFromBuildmaster(self)
+
+        # and then tell the botmaster if anything's changed
         if somethingChanged:
             sortedAllBuilders = [allBuilders[name] for name in newBuilderNames]
             d = self.botmaster.setBuilders(sortedAllBuilders)
