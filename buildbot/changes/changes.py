@@ -86,6 +86,9 @@ class Change:
         # Older Changes won't have a 'properties' attribute in them
         if not hasattr(self, 'properties'):
             self.properties = Properties()
+        # Older changes won't have a 'repository' attribute in them
+        if not hasattr(self, 'repository'):
+            self.repository = None
 
     def asText(self):
         data = ""
