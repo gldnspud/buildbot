@@ -13,6 +13,7 @@ from buildbot.process.properties import Properties
 html_tmpl = """
 <p>Changed by: <b>%(who)s</b><br />
 Changed at: <b>%(at)s</b><br />
+%(repository)s
 %(branch)s
 %(revision)s
 <br />
@@ -58,7 +59,7 @@ class Change:
 
     def __init__(self, who, files, comments, isdir=0, links=None,
                  revision=None, when=None, branch=None, category=None,
-                 revlink='', properties={}):
+                 repository=None, revlink='', properties={}):
         self.who = who
         self.comments = comments
         self.isdir = isdir
@@ -70,6 +71,7 @@ class Change:
             when = util.now()
         self.when = when
         self.branch = branch
+        self.repository = repository
         self.category = category
         self.revlink = revlink
         self.properties = Properties()
@@ -90,6 +92,7 @@ class Change:
         data += self.getFileContents()
         data += "At: %s\n" % self.getTime()
         data += "Changed By: %s\n" % self.who
+        data += "Repository: %s\n" % self.repository
         data += "Comments: %s" % self.comments
         data += "Properties: \n%s\n\n" % self.getProperties()
         return data
@@ -112,6 +115,9 @@ class Change:
         else:
             revision = ''
 
+        repository = ""
+        if self.repository:
+            repository = "Repository: <b>%s</b><br />\n" % self.repository
         branch = ""
         if self.branch:
             branch = "Branch: <b>%s</b><br />\n" % self.branch
@@ -124,6 +130,7 @@ class Change:
                    'at'        : self.getTime(),
                    'files'     : html.UL(links) + '\n',
                    'revision'  : revision,
+                   'repository': repository,
                    'branch'    : branch,
                    'comments'  : html.PRE(self.comments),
                    'properties': html.UL(properties) + '\n' }
@@ -178,7 +185,7 @@ class Change:
             for f in self.files:
                 data += " %s\n" % f
         return data
-        
+
     def getProperties(self):
         data = ""
         for prop in self.properties.asList():
@@ -207,7 +214,7 @@ class ChangeMaster(service.MultiService):
     objects.
 
     There are several different variants of the second type of source:
-    
+
       - L{buildbot.changes.mail.MaildirSource} watches a maildir for CVS
         commit mail. It uses DNotify if available, or polls every 10
         seconds if not.  It parses incoming mail to determine what files
@@ -216,7 +223,7 @@ class ChangeMaster(service.MultiService):
       - L{buildbot.changes.freshcvs.FreshCVSSource} makes a PB
         connection to the CVSToys 'freshcvs' daemon and relays any
         changes it announces.
-    
+
     """
 
     implements(interfaces.IEventSource)
@@ -249,9 +256,10 @@ class ChangeMaster(service.MultiService):
     def addChange(self, change):
         """Deliver a file change event. The event should be a Change object.
         This method will timestamp the object as it is received."""
-        log.msg("adding change, who %s, %d files, rev=%s, branch=%s, "
+        log.msg("adding change, who %s, %d files, rev=%s, branch=%s, repos=%s, "
                 "comments %s, category %s" % (change.who, len(change.files),
                                               change.revision, change.branch,
+                                              change.repository,
                                               change.comments, change.category))
         change.number = self.nextNumber
         self.nextNumber += 1

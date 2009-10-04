@@ -37,9 +37,12 @@ from buildbot.scripts import runner
 from optparse import OptionParser
 
 # Modify this to fit your setup, or pass in --master server:host on the
-# command line
+# command line and/or --repo repourl
 
 master = "localhost:9989"
+#repo = "git://example.com/path/to/repo.git"
+repo = None
+
 
 # When sending the notification, send this category iff
 # it's set (via --category)
@@ -67,6 +70,8 @@ def addChange(dummy, remote, changei):
     except StopIteration:
         remote.broker.transport.loseConnection()
         return None
+
+    c['repository'] = repo
 
     logging.info("New revision: %s" % c['revision'][:8])
     for key, value in c.iteritems():
@@ -263,12 +268,16 @@ def parse_options():
             help="Log to the specified file")
     parser.add_option("-v", "--verbose", action="count",
             help="Be more verbose. Ignored if -l is not specified.")
-    master_help = ("Build master to push to. Default is %(master)s" % 
+    master_help = ("Build master to push to. Default is %(master)s" %
                    { 'master' : master })
     parser.add_option("-m", "--master", action="store", type="string",
             help=master_help)
     parser.add_option("-c", "--category", action="store",
                       type="string", help="Scheduler category to notify.")
+    repo_help = ("Repository URL to report. Default is %(repo)s" %
+                 {'repo': repo})
+    parser.add_option('-r', '--repo', action='store', type='string',
+                      help=repo_help)
     options, args = parser.parse_args()
     return options
 
@@ -299,6 +308,8 @@ try:
 
     if options.master:
         master=options.master
+    if options.repo:
+        repo = options.repo
 
     if options.category:
         category = options.category

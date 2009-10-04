@@ -90,7 +90,7 @@ class Scheduler(BaseUpstreamScheduler):
     compare_attrs = ('name', 'treeStableTimer', 'builderNames', 'branch',
                      'fileIsImportant', 'properties', 'categories')
     
-    def __init__(self, name, branch, treeStableTimer, builderNames,
+    def __init__(self, name, repository, branch, treeStableTimer, builderNames,
                  fileIsImportant=None, properties={}, categories=None):
         """
         @param name: the name of this Scheduler
@@ -128,6 +128,7 @@ class Scheduler(BaseUpstreamScheduler):
         for b in builderNames:
             assert isinstance(b, str), errmsg
         self.builderNames = builderNames
+        self.repository = repository
         self.branch = branch
         if fileIsImportant:
             assert callable(fileIsImportant)
@@ -148,6 +149,9 @@ class Scheduler(BaseUpstreamScheduler):
         return []
 
     def addChange(self, change):
+        if self.repository and (change.repository != self.repository):
+            log.msg("%s ignoring off-repository %s" % (self, change))
+            return
         if change.branch != self.branch:
             log.msg("%s ignoring off-branch %s" % (self, change))
             return
